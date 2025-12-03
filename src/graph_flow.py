@@ -281,21 +281,43 @@ WeatherAgent = create_specialist_agent(weather_prompt)
 
 # --- 5. 도구 실행 노드 ---
 def call_tools(state: AgentState):
+    """
+    Agent가 요청한 도구 호출을 수행하고, 필요한 context(destination, dates)를 
+    state에서 가져와 도구에 주입합니다. (지역 필터링, 날씨 정보 누락 해결)
+    """
     last_message = state['messages'][-1]
     if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
         return {}
         
     tool_messages = []
     weather_update = state.get('current_weather')
+    
+    # [핵심 수정] 도구에 전달할 컨텍스트(destination, dates)를 상태에서 가져옴
+    current_destination = state.get('destination')
+    current_dates = state.get('dates') 
+    
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
+        tool_args = tool_call["args"].copy() # 인자를 복사하여 수정
         tool_to_call = AVAILABLE_TOOLS.get(tool_name)
         output = ""
+        
+        # --- [수정] 도구별 인자 주입 로직 ---
+        # 1. search_attractions_and_reviews 도구에 destination 주입
+        if tool_name == "search_attractions_and_reviews" and 'destination' not in tool_args:
+            tool_args['destination'] = current_destination
+        
+        # 2. get_weather_forecast 도구에 destination과 dates 주입
+        if tool_name == "get_weather_forecast":
+            if 'destination' not in tool_args: tool_args['destination'] = current_destination
+            if 'dates' not in tool_args: tool_args['dates'] = current_dates
+        # ------------------------------------
+        
         if not tool_to_call:
             output = f"오류: '{tool_name}'라는 이름의 도구를 찾을 수 없습니다."
         else:
             try:
+                # 수정된 tool_args를 사용하여 도구 실행
                 output = tool_to_call.invoke(tool_args)
                 if tool_name == "get_weather_forecast":
                     weather_update = output
@@ -337,16 +359,23 @@ def build_graph():
     # 전문가 노드들의 다음 경로 설정 (도구 호출 또는 종료)
     def expert_router(state: AgentState):
         last_message = state['messages'][-1]
+        
+        # 메시지가 AIMessage일 때만 처리합니다.
         if isinstance(last_message, AIMessage):
-            # 1순위: Supervisor가 PDF용 JSON을 생성했는지 확인
-            if "[FINAL_ITINERARY_JSON]" in last_message.content:
-                print("Router -> PDFCreationAgent (JSON 데이터 확인)")
+            # 1순위: Supervisor가 PDF용 JSON을 생성했는지 확인 (Content를 표준화하여 검사)
+            # normalize_content_to_str을 사용하여 LLM 출력의 모든 변형을 처리합니다.
+            normalized_content = normalize_content_to_str(last_message.content) 
+            
+            if "[FINAL_ITINERARY_JSON]" in normalized_content:
+                print("Router -> PDFCreationAgent (JSON 데이터 확인 성공)")
                 return "PDFCreationAgent"
+                
             # 2순위: 도구 호출이 있는지 확인
             if last_message.tool_calls:
                 print(f"Router -> call_tools (도구: {[tc['name'] for tc in last_message.tool_calls]})")
                 return "call_tools"
-        # 3순위: 위 조건에 해당하지 않으면 종료
+                
+        # 3순위: 위 조건에 해당하지 않으면 종료 (라우터 멈춤 방지)
         print("Router -> END")
         return END
 

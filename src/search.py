@@ -1,47 +1,68 @@
-from typing import List, Any
+# src/search.py
+
+from typing import List, Any, Optional
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
-from src.region_cut_fuzz import parse_regions_from_query
 
 class RegionPreFilteringRetriever(BaseRetriever):
     """
-    사용자 쿼리에서 지역을 파싱하여, FAISS 검색 시 'Pre-filtering'을 수행하는 Retriever.
-    기존 Retriever와 입출력 형식이 동일하여 바로 교체 가능합니다.
+    고정된 목적지(fixed_location) 기준으로 1차 필터링 후,
+    쿼리 키워드로 2차 필터링을 수행하는 하이브리드 리트리버.
+    (한글 키 '지역', '장소명' 지원 버전)
     """
-    vectorstore: Any # FAISS 인스턴스
-    k: int = 3       # 기본 검색 개수 (필터링이 강력하므로 적어도 됨)
-    fuzzy_threshold: int = 85
+    vectorstore: Any 
+    k: int = 3
+    fixed_location: Optional[str] = None # 예: "서울특별시" (정규화된 명칭)
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
     ) -> List[Document]:
         
-        # 1. 쿼리에서 지역 파싱 (예: "부산 맛집" -> {'부산'})
-        allowed_regions = parse_regions_from_query(
-            query, 
-            fuzzy=True, 
-            fuzzy_threshold=self.fuzzy_threshold
-        )
+        query_tokens = query.split()
 
-        # 2. FAISS용 필터 함수 정의 (Pre-filtering용)
-        # 이 함수가 True를 반환하는 문서만 검색 후보에 오릅니다.
+        # [필터링 키워드 설정]
+        target_keywords = []
+        if self.fixed_location:
+            # 1. 공식 명칭 (예: 서울특별시)
+            target_keywords.append(self.fixed_location) 
+            
+            # 2. 약칭 처리 (예: 서울특별시 -> 서울)
+            if "특별" in self.fixed_location or "광역" in self.fixed_location:
+                short_name = self.fixed_location.replace("특별시", "").replace("광역시", "").replace("특별자치시", "").replace("특별자치도", "")
+                target_keywords.append(short_name)
+
         def filter_func(metadata: dict) -> bool:
-            # 지역 제한이 없으면 모든 문서 통과
-            if not allowed_regions:
-                return True
+            # [핵심 수정] 한글 키 '지역'을 우선적으로 확인
+            meta_region = str(metadata.get("지역") or metadata.get("region") or "")
             
-            # 메타데이터에서 지역 정보 가져오기 (키 이름 호환성 체크)
-            meta_region = str(metadata.get("region") or metadata.get("지역") or "")
-            
-            # 부분 일치 확인 (예: '부산' in '부산광역시 중구')
-            for target in allowed_regions:
-                if target in meta_region:
-                    return True
-            return False
+            # 1. 목적지(광역시/도) 강제 필터링
+            if self.fixed_location:
+                is_region_match = False
+                for kw in target_keywords:
+                    if kw in meta_region:
+                        is_region_match = True
+                        break
+                
+                if not is_region_match:
+                    return False # 지역 불일치 시 탈락
 
-        # 3. 필터가 적용된 상태로 유사도 검색 수행
-        # LangChain FAISS는 filter 인자에 함수(callable)를 넣을 수 있습니다.
+            # 2. 쿼리 키워드 매칭 (하위 지역 필터링)
+            token_match = False
+            has_sub_region_in_query = False
+            
+            for token in query_tokens:
+                if len(token) >= 2 and token in meta_region:
+                    token_match = True
+                    has_sub_region_in_query = True
+                    break
+            
+            if has_sub_region_in_query:
+                return token_match
+            else:
+                return True 
+
+        # 필터 적용 검색 실행
         docs = self.vectorstore.similarity_search(
             query, 
             k=self.k, 

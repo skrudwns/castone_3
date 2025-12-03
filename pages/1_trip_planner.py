@@ -1,13 +1,14 @@
-# pages/2_💬_AI_여행_플래너.py
+# pages/1_trip_planner.py
 
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
-from src.graph_flow import build_graph, AgentState # 사용자님의 프로젝트 구조에 맞게 수정
+from src.graph_flow import build_graph, AgentState 
 import re
 from datetime import datetime
 
 # PDF 생성을 위한 라이브러리 임포트
 from fpdf import FPDF
+from src.tools import get_detailed_route
 
 # --- 1. 페이지 직접 접근 방지 ---
 if not st.session_state.get("preferences_collected", False):
@@ -17,18 +18,18 @@ if not st.session_state.get("preferences_collected", False):
     st.stop()
 
 # --- PDF 생성 함수 ---
-def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, total_days):
-    """세션 상태 정보를 바탕으로 여행 계획 PDF를 생성합니다."""
+def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, total_days, route_details=None):
+    """세션 상태 정보를 바탕으로 여행 계획 PDF를 생성합니다. (경로 정보 포함)"""
     pdf = FPDF()
     pdf.add_page()
 
-    # !!! 중요: 한글 폰트 설정 !!!
+    # 폰트 설정
     try:
         pdf.add_font('NanumGothic', '', 'NanumGothic.ttf', uni=True)
         pdf.add_font('NanumGothic', 'B', 'NanumGothicBold.ttf', uni=True) 
         pdf.set_font('NanumGothic', '', 12)
     except RuntimeError:
-        print("PDF ERROR: 한글 폰트 파일('NanumGothic.ttf')을 찾을 수 없습니다. 프로젝트 폴더에 폰트 파일을 추가해주세요.")
+        print("PDF ERROR: 폰트 파일을 찾을 수 없습니다.")
         return None
 
     # 1. 표지
@@ -53,18 +54,34 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
             pdf.cell(0, 10, "  - 계획된 장소가 없습니다.", ln=True)
             continue
 
-        for item in places_today:
-            # 장소 이름 출력 (조금 더 굵게)
-            pdf.set_font('NanumGothic', 'B', 12) # 'B' for Bold
+        for i, item in enumerate(places_today):
+            # 장소 이름
+            pdf.set_font('NanumGothic', 'B', 12)
             pdf.cell(0, 8, f"  - [{item.get('type', '장소')}] {item.get('name', '이름 없음')}", ln=True)
             
-            # 설명이 있다면, 작은 글씨로 예쁘게 출력
+            # 설명
             if item.get('description'):
-                pdf.set_font('NanumGothic', '', 10) # 일반, 작은 폰트
-                pdf.set_x(15) # 살짝 들여쓰기
+                pdf.set_font('NanumGothic', '', 10)
+                pdf.set_x(15)
                 pdf.multi_cell(0, 5, f"    └ {item['description']}")
-                pdf.ln(2) # 설명 뒤에 약간의 간격 추가
-        
+                pdf.ln(2)
+            
+            # [추가됨] 다음 장소로 가는 경로 정보 출력
+            if i < len(places_today) - 1 and route_details:
+                # 저장할 때 썼던 키와 동일한 규칙으로 찾기 (DayN_0, DayN_1 ...)
+                route_key = f"Day{day_num}_{i}"
+                info = route_details.get(route_key)
+                
+                if info:
+                    pdf.set_text_color(100, 100, 100) # 회색
+                    pdf.set_font('NanumGothic', '', 9)
+                    # "⬇️ [BUS] 143번 (약 20분)" 형태로 출력
+                    step_summary = info['steps'][0] if info['steps'] else "이동"
+                    pdf.set_x(15)
+                    pdf.cell(0, 6, f"      ⬇️ {step_summary} ({info['duration']})", ln=True)
+                    pdf.set_text_color(0, 0, 0) # 다시 검정
+                    pdf.ln(2)
+
         pdf.ln(10)
         pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
         pdf.ln(5)
@@ -72,7 +89,7 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
         pdf.cell(0, 10, "메모:", ln=True)
         pdf.ln(40)
 
-    # 3. 종합 정보 페이지
+    # 3. 종합 정보
     pdf.add_page()
     pdf.set_font_size(18)
     pdf.cell(0, 15, "종합 정보", ln=True)
@@ -89,9 +106,7 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
     pdf.multi_cell(0, 5, final_routes)
     pdf.ln(10)
     
-    # [수정된 부분] bytearray를 Streamlit이 요구하는 bytes 타입으로 변환합니다.
     return bytes(pdf.output())
-
 
 # --- 2. 페이지 설정 및 AI 에이전트 로딩 ---
 st.set_page_config(page_title="AI 여행 플래너", layout="centered")
@@ -133,7 +148,23 @@ if not st.session_state.messages:
     st.session_state.messages.append(HumanMessage(content=initial_prompt))
 
 # --- 5. 상태 업데이트 파싱 로직 ---
-def update_state_from_message(message_text: str):
+def update_state_from_message(message_text):
+    # [안전장치] message_text가 문자열이 아닌 경우 처리
+    if not isinstance(message_text, str):
+        if isinstance(message_text, list):
+            text_parts = []
+            for item in message_text:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict) and "text" in item:
+                    text_parts.append(item["text"])
+            message_text = "\n".join(text_parts)
+        else:
+            message_text = str(message_text)
+            
+    if not message_text:
+        return
+
     match_plan = re.search(r"'(.*?)'을/를 (\d+)일차 (관광지|식당|카페) 계획에 추가합니다", message_text)
     if match_plan:
         place_name, day, place_type = match_plan.groups()
@@ -155,6 +186,7 @@ def update_state_from_message(message_text: str):
                     try: value = int(value)
                     except ValueError: pass
                 setattr(st.session_state, key, value)
+
 
 # --- 6. UI 및 메인 실행 로직 ---
 def run_ai_agent():
@@ -187,29 +219,120 @@ def run_ai_agent():
 
 # 이전 대화 기록 UI 출력
 for msg in st.session_state.messages:
+    content_to_display = msg.content
+    
+    if not isinstance(content_to_display, str):
+        if isinstance(content_to_display, list):
+            text_parts = []
+            for item in content_to_display:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict) and "text" in item:
+                    text_parts.append(item["text"])
+            content_to_display = "\n".join(text_parts)
+        else:
+            content_to_display = str(content_to_display)
+
     if isinstance(msg, HumanMessage):
-        st.chat_message("user").markdown(msg.content)
-    elif isinstance(msg, AIMessage) and msg.content:
+        st.chat_message("user").markdown(content_to_display)
+    elif isinstance(msg, AIMessage) and content_to_display:
         cleaned_text = re.sub(
             r"\[FINAL_ITINERARY_JSON\].*?\[/FINAL_ITINERARY_JSON\]", 
             "", 
-            msg.content, 
+            content_to_display, 
             flags=re.DOTALL
         )
-        
         cleaned_text = re.sub(
             r"\[(STATE_UPDATE|PLAN_ADD):.*?\]", 
             "", 
             cleaned_text, 
             flags=re.DOTALL
         )
-
         display_text = cleaned_text.strip()
         if display_text:
             st.chat_message("assistant").markdown(display_text)
 
-# PDF 다운로드 버튼 표시 로직
+# --- [수정된] PDF 다운로드 및 경로 분석 섹션 ---
 if st.session_state.get("show_pdf_button", False):
+    
+    # 1. 상세 경로 계산 버튼 (PDF 위에 배치)
+    if st.session_state.itinerary:
+        st.markdown("---")
+        st.subheader("🗺️ 실시간 이동 경로 분석")
+        
+        # 경로 정보 저장소 초기화
+        if "route_details" not in st.session_state:
+            st.session_state.route_details = {} 
+
+        # [계산 로직] 버튼 클릭 시
+        if st.button("🚀 상세 이동 경로 및 소요시간 계산하기"):
+            with st.spinner("구글 지도에서 실시간 교통 정보를 가져오는 중입니다..."):
+                # [핵심 수정] 날짜별로 장소를 분류해야 인덱스(i)를 0부터 다시 셀 수 있음
+                places_by_day = {}
+                sorted_all = sorted(st.session_state.itinerary, key=lambda x: x['day'])
+                for item in sorted_all:
+                    d = item['day']
+                    if d not in places_by_day: places_by_day[d] = []
+                    places_by_day[d].append(item)
+                
+                temp_routes = {}
+                
+                # 날짜별 루프
+                for day_num, places in places_by_day.items():
+                    for i in range(len(places) - 1):
+                        start = places[i]
+                        end = places[i+1]
+                        
+                        # 키 생성 규칙: Day{날짜}_{순번} (예: Day2_0)
+                        # 이렇게 해야 PDF 함수 및 아래 표시 로직과 번지수가 맞음
+                        route_key = f"Day{day_num}_{i}"
+                        
+                        # tools.py 함수 호출
+                        route_info = get_detailed_route(
+                            start['name'], 
+                            end['name'], 
+                            mode="transit"
+                        )
+                        
+                        if route_info:
+                            temp_routes[route_key] = route_info
+                
+                st.session_state.route_details = temp_routes
+                st.success("경로 분석 완료! 아래 PDF를 다운로드하면 이동 정보가 포함됩니다.")
+                st.rerun() # 화면 갱신
+
+        # [표시 로직] 계산된 경로가 있으면 화면에 보여주기
+        if st.session_state.get("route_details"):
+            sorted_all = sorted(st.session_state.itinerary, key=lambda x: x['day'])
+            
+            # [핵심 수정] 표시할 때도 날짜별로 분류해서 키를 찾아야 함
+            places_by_day_display = {}
+            for item in sorted_all:
+                d = item['day']
+                if d not in places_by_day_display: places_by_day_display[d] = []
+                places_by_day_display[d].append(item)
+
+            for day_num, places in places_by_day_display.items():
+                # 날짜별 이동 경로 표시
+                for i in range(len(places) - 1):
+                    start = places[i]
+                    end = places[i+1]
+                    
+                    # 키 생성 (위 계산 로직과 동일)
+                    key = f"Day{day_num}_{i}"
+                    
+                    info = st.session_state.route_details.get(key)
+                    
+                    if info:
+                        steps_str = " -> ".join(info['steps']) if info['steps'] else "도보/이동"
+                        with st.expander(f"📍 Day {day_num} | {start['name']} ➡️ {end['name']} ({info['duration']})"):
+                            st.write(f"**총 거리:** {info['distance']}")
+                            st.info(f"**이동 경로:** {steps_str}")
+                    else:
+                        with st.expander(f"Day {day_num} | {start['name']} ➡️ {end['name']}"):
+                            st.caption("경로 정보를 불러올 수 없습니다.")
+
+    # 2. PDF 생성 및 다운로드 로직
     final_routes_text = ""
     for msg in reversed(st.session_state.messages):
         if isinstance(msg, AIMessage) and "최적 경로 제안" in msg.content:
@@ -219,30 +342,25 @@ if st.session_state.get("show_pdf_button", False):
     if not final_routes_text:
         final_routes_text = "최적 경로가 아직 계산되지 않았습니다."
 
-    #디버깅 
-        st.write("--- PDF 생성 직전 데이터 확인 ---")
-    st.write("전달될 일정 (itinerary):", st.session_state.itinerary)
-    st.write("전달될 최적 경로 (final_routes):", final_routes_text)
-    st.write("------------------------------------")
-
     pdf_bytes = create_itinerary_pdf(
         itinerary=st.session_state.itinerary,
         destination=st.session_state.destination,
         dates=st.session_state.dates,
         weather=st.session_state.current_weather,
         final_routes=final_routes_text,
-        total_days=st.session_state.total_days
+        total_days=st.session_state.total_days,
+        route_details=st.session_state.get("route_details") # 👈 데이터 전달
     )
     
     if pdf_bytes:
         st.download_button(
-            label="📄 여행 계획 PDF 다운로드",
+            label="📄 여행 계획 PDF 다운로드 (이동 경로 포함)",
             data=pdf_bytes,
             file_name=f"{st.session_state.destination}_여행계획_{datetime.now().strftime('%Y%m%d')}.pdf",
             mime="application/pdf"
         )
     else:
-        st.error("PDF 파일 생성에 실패했습니다. 콘솔 로그에서 폰트 파일 관련 에러를 확인해주세요.")
+        st.error("PDF 파일 생성 실패: 폰트 파일을 확인해주세요.")
 
 # 최초 실행 또는 사용자 입력 시 AI 호출
 if 'last_message_count' not in st.session_state:

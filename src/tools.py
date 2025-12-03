@@ -1,5 +1,7 @@
+# src/tools.py (전체 코드)
+
 import os, json
-import requests
+import requests  # API 호출용
 import datetime
 import re 
 from typing import List, Any 
@@ -10,25 +12,21 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.load import dumps, loads
 from src.config import LLM, load_faiss_index, GMAPS_CLIENT
-
+from src.region_cut_fuzz import normalize_region_name # 👈 [핵심] 정규화 함수 임포트
 from itertools import permutations
-from src.search import RegionPreFilteringRetriever  # <--- 추가
+from src.search import RegionPreFilteringRetriever  
+from src.time_planner import TimedItinerary, plan
 
+# --- 헬퍼 함수 (변경 없음) ---
 
 def normalize_message_to_str(message: Any) -> str:
     """LLM / LangChain 메시지나 content를 항상 str로 변환."""
     if message is None:
         return ""
-
-    # BaseMessage 같은 객체면 .content 다시 태워서 처리
     if hasattr(message, "content"):
         return normalize_message_to_str(message.content)
-
-    # 이미 str이면 그대로
     if isinstance(message, str):
         return message
-
-    # 멀티파트: [{"type": "text", "text": "..."}, ...]
     if isinstance(message, list):
         parts = []
         for part in message:
@@ -40,24 +38,18 @@ def normalize_message_to_str(message: Any) -> str:
             else:
                 parts.append(str(part))
         return "\n".join(parts)
-
-    # dict인 경우 JSON 문자열로
     if isinstance(message, dict):
         try:
             return json.dumps(message, ensure_ascii=False)
         except TypeError:
             return str(message)
-
-    # 나머지는 일단 문자열 캐스팅
     return str(message)
-
-# --- RAG 헬퍼 함수 ---
 
 def format_docs(docs):
     """검색된 Document 객체를 LLM 프롬프트용 문자열로 변환합니다."""
     return "\n\n".join(doc.page_content for doc in docs)
 
-# --- RAG 체인 구성 ---
+# --- RAG 체인 구성 (쿼리 생성 부분은 유지) ---
 
 # 2. RAG-Fusion용 쿼리 생성 프롬프트
 template = """
@@ -89,29 +81,32 @@ generate_queries = (
     | clean_generated_queries 
 )
 
-# 6. RAG 후보 목록 생성 프롬프트
+# 6. RAG 후보 목록 생성 프롬프트 (👈 [수정] 추천 다양화 및 카테고리화)
 final_prompt = ChatPromptTemplate.from_template(
-    """당신은 AI 여행 가이드의 검색 조수입니다.
-제공된 맥락(리뷰 데이터)을 참고하여, 사용자 질문에 대한 '후보 장소 목록'을 생성하세요.
+    """당신은 전문 여행 가이드입니다. 제공된 [검색 결과]를 바탕으로 사용자 질문에 답하세요.
 
-지침:
-1.  결과는 반드시 '후보 목록' 형식이어야 합니다.
-2.  최대 5개의 후보를 제시하세요.
-3.  각 후보는 [이름]과 [핵심 특징(한 줄 요약)]만 포함해야 합니다.
-4.  친절한 인사말이나 서론, 결론을 붙이지 마세요. 오직 목록만 반환하세요.
+[지침]
+1. **다양한 추천:** 검색 결과를 최대한 활용하여 최소 3~5곳 이상의 장소를 추천하세요.
+2. **카테고리화:** 추천 장소를 성격에 맞게 분류하세요. (예: 🏠 실내 활동, 🍽️ 한식 맛집, ☕ 오션뷰 카페, 📸 포토 스팟 등)
+3. **상세 설명:** 각 장소마다 매력 포인트, 특징, 추천 메뉴 등을 1~2문장으로 요약하여 설명하세요.
+4. **지역 확인:** 사용자가 요청한 지역이 맞는지 확인하고, 타 지역은 답변에서 언급하지 마세요. (검색 결과에 타 지역이 있다면 반드시 제외해야 합니다.)
 
---- 맥락 ---
+--- [검색 결과(Context)] ---
 {context}
 
 --- 사용자 질문 ---
 {question}
 
---- 후보 목록 (이 형식 준수) ---
-1. [장소 이름]: [특징 요약]
-2. [장소 이름]: [특징 요약]
-3. [장소 이름]: [특징 요약]
-4. [장소 이름]: [특징 요약]
-5. [장소 이름]: [특징 요약]
+--- 답변 형식 (아래 형식 준수) ---
+### 🏠 [카테고리 이름 1]
+1. **[장소명]**
+   - 설명: [상세 설명 및 특징]
+   
+### 🍽️ [카테고리 이름 2]
+1. **[장소명]**
+   - 설명: [상세 설명 및 특징]
+
+... (필요한 만큼 카테고리를 나누고 반복)
 """
 )
 
@@ -125,44 +120,51 @@ final_generation_chain = (
 # --- 4. 에이전트가 사용할 '도구(Tools)' 정의 ---
 
 @tool
-def search_attractions_and_reviews(query: str) -> str:
+# 👈 [핵심 수정 1] destination 인자 추가 (Streamlit 종속성 제거)
+def search_attractions_and_reviews(query: str, destination: str) -> str:
     """
-    사용자 쿼리를 5개로 확장(및 정제)하고,
-    '각 쿼리별 Top-1' 결과를 결합하여 후보 목록을 검색합니다.
+    사용자 쿼리를 5개로 확장하고, '각 쿼리별 Top-3' 결과를 결합하여 후보 목록을 검색합니다. 
+    (지역 필터링 적용)
     """
-    print(f"\n--- [DEBUG] search_attractions_and_reviews 호출됨 ---") # 👈 [추가]
-    print(f"DEBUG: RAG 원본 사용자 쿼리: {query}") # 👈 [추가]
+    print(f"\n--- [DEBUG RAG] RAG 검색 시작 ---") 
+    
+    # 1. 목적지 정규화 및 필터링 값 설정 (👈 지역 필터링 핵심)
+    target_city = ""
+    try:
+        raw_destination = destination # 인자로 받은 destination 사용
+        target_city = normalize_region_name(raw_destination)
+        
+        if target_city:
+            print(f"DEBUG_RAG_3: 🔒 리트리버에 고정 지역 전달: {target_city}") 
+        else:
+            print("DEBUG_RAG_3: 🔓 목적지 정보 없음. 전국 검색으로 진행.")
+    except Exception as e:
+        print(f"DEBUG_RAG_ERROR: 지역 정규화 오류: {e}")
 
     try:
         DB = load_faiss_index() # 캐시된 DB 로드
         FAISS_RETRIEVER = RegionPreFilteringRetriever(
             vectorstore=DB, 
-            k=3  # 쿼리당 3개만 가져와도 모두 지역 조건에 맞음이 보장됨
+            k=15,  # 👈 [수정] k=15로 늘려 충분한 데이터를 제공
+            fixed_location=target_city # 👈 정규화된 지역명 전달 (대구 차단)
         )        
-        retrieval_only_chain = FAISS_RETRIEVER.map() # 리트리버 체인 동적 생성
+        retrieval_only_chain = FAISS_RETRIEVER.map() 
     except Exception as e:
         print(f"!!!!!!!!!! [DEBUG] FAISS 인덱스 로드 실패 !!!!!!!!!!")
-        print(f"DEBUG: Error details: {e}")
         return "오류: RAG 벡터 데이터베이스를 로드하는 데 실패했습니다."
     
     # 1. 5개 쿼리 생성 및 정제
     generated_queries = generate_queries.invoke(query)
     
-    # 👈 [추가] RAG-Fusion을 위해 생성된 쿼리 목록 확인
-    print(f"DEBUG: RAG-Fusion 생성 쿼리 (최대 5개): {generated_queries}")
-
-    # 2. RAG 병렬 검색 (각 쿼리당 k=1)
+    # 2. RAG 병렬 검색
     parallel_search_results = retrieval_only_chain.invoke(generated_queries)
     
-    # 👈 [추가] FAISS 벡터DB가 반환한 원본 검색 결과 (Document 리스트의 리스트)
-    print(f"DEBUG: FAISS 원본 검색 결과 (Raw Docs): {parallel_search_results}")
-
-    # 3. Top-1 결과 결합 (중복 제거)
+    # 3. Top-3 결과 결합 (중복 제거) 👈 [수정] 쿼리당 Top-3을 뽑아옴
     top_1_docs = []
     seen_content = set()
     for doc_list in parallel_search_results:
-        if doc_list:
-            doc = doc_list[0]
+        # 각 쿼리 결과 리스트에서 Top-3을 뽑아 LLM에게 전달 (추천 다양화)
+        for doc in doc_list[:3]: 
             if doc.page_content not in seen_content:
                 top_1_docs.append(doc)
                 seen_content.add(doc.page_content)
@@ -170,32 +172,31 @@ def search_attractions_and_reviews(query: str) -> str:
     # 4. LLM 요약 (최종 후보 목록 생성)
     context_str = format_docs(top_1_docs)
     
-    # 👈 [추가] 요약 LLM에 전달할 최종 맥락(context) 확인
-    print(f"DEBUG: 요약 LLM에 전달할 최종 Context:\n{context_str[:500]}...") # (너무 길 수 있으니 500자만 출력)
-
-    # (만약 검색 결과가 아예 없다면 LLM을 호출할 필요 없이 바로 반환)
     if not context_str:
-        print("DEBUG: FAISS 검색 결과가 없어 빈 문자열을 반환합니다.") # 👈 [추가]
         return "오류: RAG 검색 결과가 없습니다. (벡터DB에 관련 내용 없음)"
 
     input_for_final_chain = {"context": context_str, "question": query}
     
     final_result = final_generation_chain.invoke(input_for_final_chain)
     
-    print(f"DEBUG: 최종 반환 (후보 목록):\n{final_result}") # 👈 [추가]
     return final_result
 
 @tool
+# 👈 [핵심 수정 2] 날씨 문제 해결: 5일치 모두 전달
 def get_weather_forecast(destination: str, dates: str) -> str:
     """
-    도시명(destination)으로 위도/경도를 조회하고, 그 좌표로 5일 예보를 조회하여,
-    사용자가 요청한 날짜(dates)의 날씨만 요약해 반환합니다. (3단계 날짜 파싱 적용)
+    도시명(destination)으로 위도/경도를 조회하고, 그 좌표로 OWM이 제공하는 5일 예보를 모두 가져와
+    LLM에게 전달합니다. (LLM이 여행 기간에 맞춰 요약하도록 유도)
     """
+    print(f"\n--- [DEBUG WEATHER] 날씨 검색 시작 ---")
+    print(f"DEBUG_W_1: Agent 전달 목적지: {destination}")
+    print(f"DEBUG_W_2: Agent 전달 기간: {dates}")
+    
     API_KEY = os.getenv("OWM_API_KEY")
     if not API_KEY:
         return "오류: OWM_API_KEY가 .env 파일에 설정되지 않았습니다."
 
-    # 1단계: Geocoding
+    # 1단계: Geocoding (좌표 구하기)
     geo_url = "https://api.openweathermap.org/geo/1.0/direct"
     geo_params = {'q': f"{destination},KR", 'limit': 1, 'appid': API_KEY}
     lat, lon = None, None
@@ -204,14 +205,13 @@ def get_weather_forecast(destination: str, dates: str) -> str:
         response.raise_for_status()
         geo_data = response.json()
         if geo_data:
-            lat = geo_data[0]['lat']
-            lon = geo_data[0]['lon']
+            lat, lon = geo_data[0]['lat'], geo_data[0]['lon']
         else:
             return f"오류: '{destination}'의 좌표(Geocoding)를 찾을 수 없습니다."
     except Exception as e:
         return f"오류: Geocoding API 호출 중 문제 발생: {e}"
 
-    # 2단계: Forecast
+    # 2단계: Forecast (5일 예보 데이터 가져오기)
     forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
     forecast_params = {'lat': lat, 'lon': lon, 'appid': API_KEY, 'units': 'metric', 'lang': 'kr'}
     forecasts = None
@@ -225,58 +225,84 @@ def get_weather_forecast(destination: str, dates: str) -> str:
     if not forecasts:
         return "오류: Forecast API에서 'list' 데이터를 찾을 수 없습니다."
 
-    # 3단계: 날짜 필터링 (3-Step 파싱 로직)
-    target_date_str = ""
-    today = datetime.datetime.now()
+    # 3단계: OWM의 5일치 예보를 LLM에게 모두 전달
+    summary = []
+    seen_dates = set()
+
+    for item in forecasts:
+        dt_txt = item['dt_txt']
+        date_part = dt_txt.split(" ")[0]
+        time_part = dt_txt.split(" ")[1]
+        
+        # 날짜별 대표 예보만 수집 (정오 기준 또는 최초 데이터)
+        if "12:00:00" in time_part or date_part not in seen_dates:
+            temp = item['main']['temp']
+            desc = item['weather'][0]['description']
+            seen_dates.add(date_part)
+            summary.append(f"- {date_part} 정오 기준: {temp:.1f}℃, {desc}")
+            
+    result_text = "\n".join(summary)
+    
+    print(f"DEBUG_W_3: LLM에게 전달될 OWM 5일치 데이터:\n{result_text}")
+    
+    # LLM에게 5일치 정보를 다 주고, 사용자 날짜에 맞는 것만 골라 쓰라고 지시
+    return f"[{destination} 5일치 날씨 예보 데이터]\n{result_text}\n\n[사용자 요청 기간: {dates}]\n(위 데이터 중 여행 기간에 해당하는 날짜만 골라서 답변하세요.)"
+    
+# --- (나머지 도구 함수는 그대로 유지) ---
+def get_detailed_route(start_place: str, end_place: str, mode="transit"):
+    # (코드 내용 변경 없음. 인자만 사용)
+    # ...
+    # (기존 코드 유지)
+    # ...
+    if not GMAPS_CLIENT:
+        print("DEBUG: GMAPS_CLIENT가 설정되지 않았습니다.")
+        return None
     
     try:
-        # 1. 'YYYY년 M월 D일' (공백 O)
-        target_date_obj = datetime.datetime.strptime(dates, "%Y년 %m월 %d일")
-        target_date_str = target_date_obj.strftime("%Y-%m-%d")
-    except ValueError:
-        try:
-            # 2. 'YYYY년MM월DD일' (공백 X)
-            target_date_obj = datetime.datetime.strptime(dates, "%Y년%m월%d일")
-            target_date_str = target_date_obj.strftime("%Y-%m-%d")
-        except ValueError:
-            try:
-                # 3. 'M월 D일' (연도 없음)
-                target_date_obj = datetime.datetime.strptime(dates, "%m월 %d일")
-                target_date_obj = target_date_obj.replace(year=today.year)
-                target_date_str = target_date_obj.strftime("%Y-%m-%d")
-            except ValueError:
-                 # 4. 모든 형식 실패 -> 키워드 검색
-                 if "주말" in dates or "토요일" in dates:
-                     days_until_saturday = (5 - today.weekday() + 7) % 7
-                     saturday = today + datetime.timedelta(days=days_until_saturday)
-                     target_date_str = saturday.strftime("%Y-%m-%d")
-                 elif "내일" in dates:
-                     tomorrow = today + datetime.timedelta(days=1)
-                     target_date_str = tomorrow.strftime("%Y-%m-%d")
-                 else: 
-                     tomorrow = today + datetime.timedelta(days=1)
-                     target_date_str = tomorrow.strftime("%Y-%m-%d")
-    
-    # 4단계: 결과 가공
-    output_str = f"[{destination} ({target_date_str}) 날씨 예보 (OWM)]\n"
-    found = False
-    for forecast in forecasts:
-        if forecast['dt_txt'].startswith(target_date_str):
-            time_utc = forecast['dt_txt'].split(' ')[1][:5]
-            temp = forecast['main']['temp'] 
-            desc = forecast['weather'][0]['description']
-            output_str += f"- {time_utc} (UTC): {temp:.1f}℃, {desc}\n"
-            found = True
-    
-    if not found:
-        return f"정보: {target_date_str} 날짜의 예보를 찾을 수 없습니다. (OWM은 5일치만 제공)"
-    
-    return output_str
-    
+        directions_result = GMAPS_CLIENT.directions(
+            origin=start_place,
+            destination=end_place,
+            mode=mode,
+            departure_time=datetime.datetime.now(),
+            region="KR",
+            language="ko"
+        )
+        
+        if not directions_result:
+            return None
+
+        route = directions_result[0]['legs'][0]
+        duration = route['duration']['text']
+        distance = route['distance']['text']
+        
+        steps_summary = []
+        for step in route['steps']:
+            travel_mode = step['travel_mode']
+            
+            if travel_mode == 'TRANSIT':
+                transit_details = step['transit_details']
+                line_name = transit_details['line'].get('short_name') or transit_details['line'].get('name')
+                vehicle_type = transit_details['line']['vehicle']['type']
+                steps_summary.append(f"[{vehicle_type}] {line_name}")
+            
+            elif travel_mode == 'WALKING':
+                if step['duration']['value'] > 300: 
+                    steps_summary.append(f"🚶 도보 {step['duration']['text']}")
+
+        return {
+            "duration": duration,
+            "distance": distance,
+            "steps": steps_summary
+        }
+
+    except Exception as e:
+        print(f"ERROR: 상세 경로 조회 중 오류 발생: {e}")
+        return None
+
 @tool
 def optimize_and_get_routes(places: List[str]) -> str:
     """
-    (수정됨) 여러 장소(places)의 최적 방문 순서를 'distance_matrix' API로 계산하고,
+    여러 장소(places)의 최적 방문 순서를 'distance_matrix' API로 계산하고,
     '최적 순서'와 '예상 총 이동 시간'만 반환합니다. (상세 경로X)
     """
     if not GMAPS_CLIENT:
@@ -314,8 +340,6 @@ def optimize_and_get_routes(places: List[str]) -> str:
                 if el['status'] == 'OK':
                     duration_val = el['duration']['value']
                     duration_row.append(duration_val)
-                    # (로그가 너무 길어질 수 있으므로 소요 시간 개별 출력은 주석 처리)
-                    # print(f"DEBUG: [ {places[i]} -> {places[j]} ] 소요 시간: {duration_val} 초")
                 else:
                     print(f"DEBUG: [ {places[i]} -> {places[j]} ] 구간 경로 없음 (Status: {el['status']})")
                     duration_row.append(float('inf')) 
@@ -354,9 +378,8 @@ def optimize_and_get_routes(places: List[str]) -> str:
         print(f"DEBUG: Error details: {e}")
         return f"오류: 경로 최적화 로직 중 알 수 없는 문제 발생: {e}"
 
-    # --- 3단계: (수정됨) 상세 경로 없이 결과 요약 ---
+    # --- 3단계: 상세 경로 없이 결과 요약 ---
     
-    # 👈 [수정] 3단계(상세 경로 조회 루프)를 삭제하고, 2단계의 결과로만 요약본을 생성합니다.
     output_str = f"--- 🗺️ 최적 경로 제안 (총 {len(optimized_places)}곳) ---\n"
     output_str += f"계산된 최적 순서: {' → '.join(optimized_places)}\n"
     output_str += f"예상 총 이동 시간(대중교통): 약 {min_duration // 60} 분\n"
@@ -365,6 +388,35 @@ def optimize_and_get_routes(places: List[str]) -> str:
     print("DEBUG: optimize_and_get_routes (v2) 성공적으로 완료. (상세 경로 제외)")
     return output_str
 
+@tool
+def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
+    """
+    주어진 전체 여행 일정(식당, 관광지)을 분석하여, 각 항목에 대해 
+    합리적인 시작/종료 시간을 할당한 후 JSON 문자열로 반환합니다. 
+    이 결과는 경로 최적화 도구의 입력으로 사용됩니다.
+    """
+    print(f"\n--- [DEBUG TIME PLANNER] 시간 계획 시작 (총 {len(itinerary)}곳) ---")
+    
+    # 날짜와 시간에 따라 정렬하여 순서대로 계획해야 합니다.
+    sorted_itinerary = sorted(itinerary, key=lambda x: x['day'])
+    
+    chain = create_time_planner_chain()
+    
+    try:
+        # 체인 실행: 입력은 { 'itinerary': List[Dict] } 형식의 딕셔너리
+        result = chain.invoke({"itinerary": sorted_itinerary})
+        
+        # [수정] JSON 객체를 다시 문자열로 변환하여 LLM에게 전달 (도구는 문자열을 반환해야 함)
+        final_json_str = json.dumps(result, ensure_ascii=False, indent=2)
+        
+        print(f"DEBUG: 생성된 시간 계획 JSON:\n{final_json_str}")
+        return final_json_str
+        
+    except Exception as e:
+        print(f"!!!!!!!!!! [DEBUG] 시간 계획 체인 오류 !!!!!!!!!!")
+        print(f"DEBUG: Error details: {e}")
+        return "오류: 여행 시간 계획을 계산하는 데 실패했습니다."
+
 # 에이전트가 사용할 도구 목록
-TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes] # 👈 [수정]
+TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes]
 AVAILABLE_TOOLS = {tool.name: tool for tool in TOOLS}
