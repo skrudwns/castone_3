@@ -1,7 +1,7 @@
 
 import re
 from typing import List, Set, Dict
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 CANON: List[str] = [
     "서울","부산","대구","인천","광주","대전","울산","세종",
@@ -92,15 +92,26 @@ def parse_regions_from_query(query: str, fuzzy: bool = True, fuzzy_threshold: in
 
 def filter_docs_by_region(docs: List[Document], allowed: Set[str], field: str = "광역시/도",
                           drop_unknown: bool = True) -> List[Document]:
-    """리트리버 결과를 광역시/도로 컷. 결과 메타데이터는 정규화되어 있다고 가정."""
+    """리트리버 결과를 광역시/도로 컷. (부분 일치 허용)"""
     if not allowed:
         return docs
     out = []
     for d in docs:
-        reg = (d.metadata or {}).get(field)
-        if reg in allowed:
+        # 메타데이터 값 가져오기
+        reg = (d.metadata or {}).get(field, "")
+        if not isinstance(reg, str):
+            reg = str(reg) if reg is not None else ""
+        
+        # [수정됨] 정확 일치(==)가 아닌 포함 여부(in) 확인
+        is_match = False
+        for target in allowed:
+            if target in reg: # 예: "부산" in "부산광역시..."
+                is_match = True
+                break
+        
+        if is_match:
             out.append(d)
-        elif reg in (None, "", "nan"):
+        elif not reg or reg == "nan":
             if not drop_unknown:
                 out.append(d)
     return out

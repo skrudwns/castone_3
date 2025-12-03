@@ -8,9 +8,6 @@ from datetime import datetime
 
 # PDF 생성을 위한 라이브러리 임포트
 from fpdf import FPDF
-from src.tools import normalize_message_to_str
-
-
 
 # --- 1. 페이지 직접 접근 방지 ---
 if not st.session_state.get("preferences_collected", False):
@@ -137,7 +134,6 @@ if not st.session_state.messages:
 
 # --- 5. 상태 업데이트 파싱 로직 ---
 def update_state_from_message(message_text: str):
-    message_text = normalize_message_to_str(message_text)
     match_plan = re.search(r"'(.*?)'을/를 (\d+)일차 (관광지|식당|카페) 계획에 추가합니다", message_text)
     if match_plan:
         place_name, day, place_type = match_plan.groups()
@@ -194,10 +190,21 @@ for msg in st.session_state.messages:
     if isinstance(msg, HumanMessage):
         st.chat_message("user").markdown(msg.content)
     elif isinstance(msg, AIMessage) and msg.content:
-        raw_content = getattr(msg, "content", msg)
-        text = normalize_message_to_str(raw_content)
-    
-        display_text = re.sub(r"\[(STATE_UPDATE|PLAN_ADD):.*?\]", "", text, flags=re.DOTALL).strip()
+        cleaned_text = re.sub(
+            r"\[FINAL_ITINERARY_JSON\].*?\[/FINAL_ITINERARY_JSON\]", 
+            "", 
+            msg.content, 
+            flags=re.DOTALL
+        )
+        
+        cleaned_text = re.sub(
+            r"\[(STATE_UPDATE|PLAN_ADD):.*?\]", 
+            "", 
+            cleaned_text, 
+            flags=re.DOTALL
+        )
+
+        display_text = cleaned_text.strip()
         if display_text:
             st.chat_message("assistant").markdown(display_text)
 

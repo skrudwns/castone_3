@@ -12,7 +12,7 @@ from langchain_core.load import dumps, loads
 from src.config import LLM, load_faiss_index, GMAPS_CLIENT
 
 from itertools import permutations
-
+from src.search import RegionPreFilteringRetriever  # <--- 추가
 
 
 def normalize_message_to_str(message: Any) -> str:
@@ -135,7 +135,10 @@ def search_attractions_and_reviews(query: str) -> str:
 
     try:
         DB = load_faiss_index() # 캐시된 DB 로드
-        FAISS_RETRIEVER = DB.as_retriever(search_type="similarity", search_kwargs={'k': 1})
+        FAISS_RETRIEVER = RegionPreFilteringRetriever(
+            vectorstore=DB, 
+            k=3  # 쿼리당 3개만 가져와도 모두 지역 조건에 맞음이 보장됨
+        )        
         retrieval_only_chain = FAISS_RETRIEVER.map() # 리트리버 체인 동적 생성
     except Exception as e:
         print(f"!!!!!!!!!! [DEBUG] FAISS 인덱스 로드 실패 !!!!!!!!!!")

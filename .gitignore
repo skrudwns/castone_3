@@ -15,3 +15,6 @@ __pycache__/
 .streamlit/
 
 review_faiss/
+data_csv/data.ipynb
+
+metadata_preview.csv
