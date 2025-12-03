@@ -15,7 +15,8 @@ from src.config import LLM, load_faiss_index, GMAPS_CLIENT
 from src.region_cut_fuzz import normalize_region_name # 👈 [핵심] 정규화 함수 임포트
 from itertools import permutations
 from src.search import RegionPreFilteringRetriever  
-from src.time_planner import TimedItinerary, plan
+from src.time_planner import TimedItinerary 
+from src.time_planner import plan_itinerary_timeline as plan_timeline_impl
 
 # --- 헬퍼 함수 (변경 없음) ---
 
@@ -389,34 +390,16 @@ def optimize_and_get_routes(places: List[str]) -> str:
     return output_str
 
 @tool
-def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
+def plan_itinerary_timeline(itinerary_json_str: str) -> str:
     """
-    주어진 전체 여행 일정(식당, 관광지)을 분석하여, 각 항목에 대해 
+    [Task 4] 주어진 전체 여행 일정(JSON 문자열)을 분석하여, 각 항목에 대해 
     합리적인 시작/종료 시간을 할당한 후 JSON 문자열로 반환합니다. 
-    이 결과는 경로 최적화 도구의 입력으로 사용됩니다.
+    (이 결과는 경로 최적화 도구의 입력으로 사용됩니다.)
     """
-    print(f"\n--- [DEBUG TIME PLANNER] 시간 계획 시작 (총 {len(itinerary)}곳) ---")
-    
-    # 날짜와 시간에 따라 정렬하여 순서대로 계획해야 합니다.
-    sorted_itinerary = sorted(itinerary, key=lambda x: x['day'])
-    
-    chain = create_time_planner_chain()
-    
-    try:
-        # 체인 실행: 입력은 { 'itinerary': List[Dict] } 형식의 딕셔너리
-        result = chain.invoke({"itinerary": sorted_itinerary})
-        
-        # [수정] JSON 객체를 다시 문자열로 변환하여 LLM에게 전달 (도구는 문자열을 반환해야 함)
-        final_json_str = json.dumps(result, ensure_ascii=False, indent=2)
-        
-        print(f"DEBUG: 생성된 시간 계획 JSON:\n{final_json_str}")
-        return final_json_str
-        
-    except Exception as e:
-        print(f"!!!!!!!!!! [DEBUG] 시간 계획 체인 오류 !!!!!!!!!!")
-        print(f"DEBUG: Error details: {e}")
-        return "오류: 여행 시간 계획을 계산하는 데 실패했습니다."
+    # 👈 [수정] 임포트한 별칭 함수(src/time_planner.py의 구현)를 호출합니다.
+    return plan_timeline_impl(itinerary_json_str)
+
 
 # 에이전트가 사용할 도구 목록
-TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes]
+TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes, plan_itinerary_timeline]
 AVAILABLE_TOOLS = {tool.name: tool for tool in TOOLS}
