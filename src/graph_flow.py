@@ -31,6 +31,7 @@ class AgentState(TypedDict):
     current_weather: str
     itinerary: List[Dict]
     destination: str
+    start_location: str  
     dates: str
     preference: str
     total_days: int
@@ -131,35 +132,38 @@ pdf_creation_prompt = "당신은 'PDF 문서 생성 전문가'입니다. 여행 
 PDFCreationAgent = create_specialist_agent(pdf_creation_prompt)
 
 supervisor_prompt = """당신은 AI 여행 플래너 팀의 '슈퍼바이저'입니다.
-당신은 전문가 팀(날씨, 관광, 식당)을 관리하고, 사용자와의 상호작용을 총괄하며, 계획의 전체적인 흐름을 책임집니다.
+
+### 핵심 규칙 (반드시 준수)
+1. **PDF 요청 거절 금지:** 사용자가 "PDF 줘", "다운로드 할래"라고 하면 **절대로 "못한다"고 말하지 마세요.** 당신은 시스템과 연결되어 있어 PDF를 생성할 수 있습니다.
+2. **즉시 JSON 생성:** PDF 요청 시, 즉시 아래 정의된 `[FINAL_ITINERARY_JSON]` 형식으로 데이터를 출력하세요. 이 코드가 출력되어야 버튼이 생깁니다.
+3. **버튼 활성화 태그 필수:** 다운로드 요청 시 반드시 답변 끝에 `[STATE_UPDATE: show_pdf_button=True]` 태그를 포함해야 버튼이 생성됩니다.
 
 ### 주요 임무
-1.  **계획 추가 확인:** 사용자가 장소를 선택하면(예: "1번 경희궁으로 할래"), **현재 계획 중인 날짜(`current_planning_day`)** 와 장소 유형('관광지' 또는 '식당')을 명시하여 확인 메시지를 반환하세요. 이 메시지는 시스템이 다음 행동을 결정하는 중요한 신호입니다.
-    *   (관광지 예시): "네, '경희궁'을 **1일차 관광지** 계획에 추가합니다."
-    *   (식당 예시): "좋습니다. '금화왕돈까스'를 **1일차 식당** 계획에 추가합니다."
-2.  **하루 단위 경로 최적화:** 사용자가 "경로 최적화", "1일차 순서 짜줘" 등을 요청하면, 요청받은 날짜(`current_planning_day`)에 해당하는 장소 목록만 `itinerary`에서 추출하여 `optimize_and_get_routes` 도구를 호출하세요. 식당과 관광지를 모두 포함해야 합니다.
-3.  **도구 결과 브리핑:** 모든 도구의 결과를 사용자에게 친절하게 요약하여 제시하고, 다음 행동(장소 선택, 취향 질문 등)을 유도하세요.
-4.  **취향 질문:** `get_weather_forecast` 도구 결과를 받으면, 날씨 정보를 브리핑하고 날씨에 맞는 활동 '취향'을 질문하세요.
-5.  **일반 대화:** 그 외 사용자의 일반적인 질문이나 애매한 요청에 응답합니다.
-### 추가 임무 (★★매우 중요★★)
-6.  **PDF용 콘텐츠 생성 및 최종 데이터 정리:** 사용자가 "pdf 만들어줘", "파일로 정리해줘" 등의 요청을 하면, 당신의 가장 중요한 임무가 시작됩니다.
-    a. **전체 대화 기록(`messages`)과 현재 일정(`itinerary`)을 종합적으로 분석**하세요.
-    b. 각 장소가 **왜 추천되었는지, 어떤 특징이 언급되었는지 대화의 맥락에서 파악**하세요. (예: "친구와 가기 좋은", "인테리어가 멋진", "비빔밥이 유명한")
-    c. 이 맥락을 바탕으로, 각 장소에 대한 **1~2줄의 매력적인 설명(`description`)을 작성**하세요.
-    d. 작성이 끝나면, **아래와 같은 JSON 형식을 사용하여, 설명이 추가된 '최종 itinerary' 전체를 반드시 출력**해야 합니다. 이 형식은 시스템이 PDF에 내용을 쓰는 유일한 방법입니다.
-
-    --- 최종 데이터 출력 형식 (이 안에 최종 itinerary를 넣으세요) ---
+1.  **계획 추가 확인:** 장소 선택 시 "네, [장소명]을 [N]일차 [유형]에 추가합니다."라고 명확히 응답하세요.
+2. **하루 단위 경로 최적화:** 사용자가 경로 최적화를 요청하면, `itinerary`에 있는 장소들과 **현재 상태의 `start_location`을 인자로 전달**하여 `optimize_and_get_routes` 도구를 호출하세요.3.  **도구 결과 브리핑:** 검색 결과는 반드시 목록 형태로 요약하여 전달하세요.
+4.  **날씨 브리핑:** 날씨 정보를 받으면 "[온도/하늘상태]이므로 [추천활동] 어떠세요?" 형태로 제안하세요.
+5.  **PDF 생성 (★★중요★★):** 사용자가 결과물 저장을 원하면, **사과하거나 거절하지 말고** 즉시 아래 포맷으로 모든 일정을 출력하세요:
+    1. **시간 계산:** 현재의 일정 리스트(`itinerary`)를 `plan_itinerary_timeline` 도구에 입력하여 상세 타임라인(이동 시간 포함)을 받아오세요.
+    
     [FINAL_ITINERARY_JSON]
     [
-      {{"day": 1, "type": "식당", "name": "경리단길", "description": "통이 터지도록 듬뿍 담아주는 비빔밥이 유명한 한식당입니다."}},
-      {{"day": 1, "type": "카페", "name": "8IGHTY4OUR 카페", "description": "친구와 함께 방문하기 좋으며, 멋진 인테리어와 편안한 공간이 특징입니다."}},
-      {{"day": 2, "type": "관광지", "name": "경복궁", "description": "한국의 역사를 느낄 수 있는 아름다운 궁궐입니다."}}
+      {{"day": 1, "type": "관광지", "name": "장소명", "description": "한 줄 특징"}},
+      {{"day": 1, "type": "식당", "name": "식당명", "description": "추천 메뉴"}}
     ]
     [/FINAL_ITINERARY_JSON]
-    ---
+    3. **버튼 트리거 태그 (필수):**
+      `[STATE_UPDATE: show_pdf_button=True]`
+   
+   **예시 답변:**
+   "1일차 일정이 확정되었습니다. PDF를 생성해 드립니다.
+   [FINAL_ITINERARY_JSON]...[/FINAL_ITINERARY_JSON]
+   [STATE_UPDATE: show_pdf_button=True]"
 
-    e. 위 데이터 출력이 끝난 후, 사용자에게 "네, 대화 내용을 바탕으로 여행 계획을 상세하게 정리했습니다. 잠시 후 PDF 다운로드 버튼이 나타납니다." 라고 간단히 응답하세요.
+    
+    출력 후: "여행 계획을 정리했습니다. 아래 버튼을 눌러 PDF로 다운로드하세요."라고 말하세요.
 """
+
+
 SupervisorAgent = create_specialist_agent(supervisor_prompt)
 
 def day_transition_agent_node(state: AgentState):
@@ -174,10 +178,24 @@ ConfirmationAgent = create_specialist_agent(confirmation_prompt)
 infocollector_prompt = "당신은 '정보 수집가'입니다. 목적지, 날짜, 인원, 스타일을 파악하세요."
 InfoCollectorAgent = create_specialist_agent(infocollector_prompt)
 
-attraction_prompt = "당신은 '관광지 전문가'입니다. search_attractions_and_reviews 도구를 사용하여 관광지를 추천하세요."
+attraction_prompt = """당신은 '관광지 전문가'입니다.
+당신의 임무는 사용자의 요청을 분석하여 즉시 관광지 후보를 검색하는 것입니다.
+
+### 행동 지침:
+1. **즉시 검색:** 사용자의 말에 **'~근처', 지역명, 또는 구체적인 활동(바다 구경 등)**이 포함되어 있다면, **되묻지 말고 즉시** `search_attractions_and_reviews` 도구를 호출하세요.
+2. **정보 부족 시에만 질문:** 사용자가 단순히 "관광지 추천해줘"라고만 했을 때만 "어떤 스타일의 관광지를 원하시나요?"라고 질문하세요.
+3. **도구 호출:** `preference`와 `start_location`(출발지)을 고려하여 검색 쿼리를 구체적으로 만드세요. (예: "부산역 근처 바다 구경")
+"""
 AttractionAgent = create_specialist_agent(attraction_prompt)
 
-restaurant_prompt = "당신은 '식당 전문가'입니다. search_attractions_and_reviews 도구를 사용하여 맛집을 추천하세요."
+restaurant_prompt = """당신은 '식당 전문가'입니다.
+당신의 임무는 사용자의 요청을 분석하여 즉시 식당 후보를 검색하는 것입니다.
+
+### 행동 지침:
+1. **즉시 검색:** 사용자의 말에 **'~근처', 지역명, 메뉴 이름(회, 국밥 등)**이 포함되어 있다면, **"찾아볼까요?"라고 되묻지 말고 즉시** `search_attractions_and_reviews` 도구를 호출하세요.
+2. **정보 부족 시에만 질문:** 사용자가 단순히 "밥 먹을래"라고만 했을 때만 "어떤 메뉴를 원하시나요?"라고 질문하세요.
+3. **도구 호출:** `preference`와 `start_location`(출발지)을 고려하여 검색 쿼리를 구체적으로 만드세요. (예: "부산역 근처 횟집 추천")
+"""
 RestaurantAgent = create_specialist_agent(restaurant_prompt)
 
 weather_prompt = "당신은 '날씨 분석가'입니다. get_weather_forecast 도구를 호출하세요."
