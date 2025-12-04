@@ -29,7 +29,7 @@ if submitted:
         # 2-1. 새 리뷰 데이터 생성 (data_clean.ipynb/data_process.ipynb 컬럼명과 일치)
         new_review_data = {
             "지역": [region],
-            "장소": [place_name],
+            "장소명": [place_name],
             "카테고리_통합": [category],
             "리뷰": [review_text],
             "평점": [rating]

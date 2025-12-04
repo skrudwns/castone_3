@@ -133,7 +133,29 @@ if not st.session_state.messages:
     st.session_state.messages.append(HumanMessage(content=initial_prompt))
 
 # --- 5. 상태 업데이트 파싱 로직 ---
-def update_state_from_message(message_text: str):
+def normalize_to_string(content) -> str:
+    """어떤 형태의 content가 들어와도 안전한 문자열로 변환합니다."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # [{'type': 'text', 'text': '...'}] 형태 처리
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and 'text' in item:
+                texts.append(item['text'])
+            else:
+                texts.append(str(item))
+        return "\n".join(texts)
+    return str(content)
+
+# --- [수정] 상태 업데이트 파싱 로직 ---
+def update_state_from_message(message_content):
+    # 1. 어떤 타입이 들어오든 문자열로 강제 변환 (List, None 등 방어)
+    message_text = normalize_to_string(message_content)
+
+    # 2. 이후 로직은 변환된 문자열(message_text)을 사용하므로 안전함
     match_plan = re.search(r"'(.*?)'을/를 (\d+)일차 (관광지|식당|카페) 계획에 추가합니다", message_text)
     if match_plan:
         place_name, day, place_type = match_plan.groups()
@@ -155,9 +177,9 @@ def update_state_from_message(message_text: str):
                     try: value = int(value)
                     except ValueError: pass
                 setattr(st.session_state, key, value)
-
 # --- 6. UI 및 메인 실행 로직 ---
 def run_ai_agent():
+    config = {"configurable": {"thread_id": "main_user_session"}}
     inputs = {
         "messages": st.session_state.messages,
         "itinerary": st.session_state.itinerary,
@@ -171,7 +193,7 @@ def run_ai_agent():
         "show_pdf_button": st.session_state.show_pdf_button,
     }
     
-    response = APP.invoke(inputs)
+    response = APP.invoke(inputs,config=config)
     
     st.session_state.messages = response.get('messages', st.session_state.messages)
     st.session_state.itinerary = response.get('itinerary', st.session_state.itinerary)
@@ -189,11 +211,32 @@ def run_ai_agent():
 for msg in st.session_state.messages:
     if isinstance(msg, HumanMessage):
         st.chat_message("user").markdown(msg.content)
-    elif isinstance(msg, AIMessage) and msg.content:
+    elif isinstance(msg, AIMessage):
+        # --------------------------------------------------------
+        # 1. 안전한 문자열 변환 (리스트/None/딕셔너리 방어)
+        # --------------------------------------------------------
+        content_to_process = msg.content
+        if isinstance(content_to_process, list):
+            # 리스트인 경우 텍스트만 추출해서 합침
+            text_parts = []
+            for item in content_to_process:
+                if isinstance(item, dict) and 'text' in item:
+                    text_parts.append(item['text'])
+                else:
+                    text_parts.append(str(item))
+            safe_content = "\n".join(text_parts)
+        elif content_to_process is None:
+            safe_content = ""
+        else:
+            safe_content = str(content_to_process)
+        
+        # 내용이 없으면 출력 건너뜀
+        if not safe_content.strip():
+            continue
         cleaned_text = re.sub(
             r"\[FINAL_ITINERARY_JSON\].*?\[/FINAL_ITINERARY_JSON\]", 
             "", 
-            msg.content, 
+            safe_content, 
             flags=re.DOTALL
         )
         
