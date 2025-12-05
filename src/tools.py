@@ -29,52 +29,48 @@ from src.time_planner import plan
 def get_admin_district_from_coords(lat: float, lng: float) -> str:
     """
     좌표를 통해 '광역+기초' 행정구역을 찾습니다.
-    Result #0에 정보가 부족하면 Result #1, #2...를 순회하며 보완합니다.
+    [수정] 복잡한 순회 로직 대신, 가장 정확한 첫 번째 결과만 사용합니다.
     """
     if not GMAPS_CLIENT: return ""
 
     try:
-        # 1. API 호출
         results = GMAPS_CLIENT.reverse_geocode((lat, lng), language='ko')
-        if not results: return ""
+        if not results:
+            print(f"DEBUG: 📍 리버스 지오코딩 결과 없음 ({lat}, {lng})")
+            return ""
 
-        # 2. 가장 적절한 행정구역 찾기
-        best_do = ""
-        best_si_gu = ""
-
-        # 결과 리스트를 순회 (보통 상위 5개 안에 다 있음)
-        for i, result in enumerate(results[:5]):
-            comps = result.get('address_components', [])
+        # 가장 정확한 첫 번째 결과 사용
+        first_result = results[0]
+        comps = first_result.get('address_components', [])
+        
+        # 주소 구성요소 추출
+        level1 = "" # 광역 (e.g., 서울특별시, 경기도)
+        level2 = "" # 기초 (e.g., 강남구, 수원시)
+        
+        # 'locality'는 '수원시' 같은 시 단위를, 'sublocality_level_1'은 '강남구' 같은 구 단위를 가리킴
+        # 둘 다 있을 경우, 더 구체적인 'sublocality_level_1'을 우선
+        temp_locality = ""
+        
+        for comp in comps:
+            types = comp.get('types', [])
+            if 'administrative_area_level_1' in types:
+                level1 = comp.get('long_name', '')
+            elif 'sublocality_level_1' in types:
+                level2 = comp.get('long_name', '')
+            elif 'locality' in types:
+                temp_locality = comp.get('long_name', '')
+        
+        # '구'가 있으면 '구'를, 없으면 '시'를 사용
+        if not level2:
+            level2 = temp_locality
             
-            current_do = ""
-            current_si_gu = ""
+        # '서울특별시' 같은 경우 level1과 level2가 같을 수 있으므로 중복 제거
+        if level1 == level2:
+            final_result = level1
+        else:
+            final_result = f"{level1} {level2}".strip()
 
-            # 컴포넌트 분석
-            for comp in comps:
-                types = comp.get('types', [])
-                if 'administrative_area_level_1' in types:
-                    current_do = comp['long_name']
-                elif 'sublocality_level_1' in types:
-                    current_si_gu = comp['long_name']
-                elif 'locality' in types:
-                    # 구(sublocality)가 아직 없을 때만 시(locality) 채택
-                    if not current_si_gu:
-                        current_si_gu = comp['long_name']
-            
-            # [전략 A] 이번 결과에 '광역'과 '기초'가 둘 다 있다면 이게 베스트! -> 즉시 반환
-            if current_do and current_si_gu:
-                print(f"DEBUG: ✅ Result #{i}에서 완벽한 행정구역 발견: {current_do} {current_si_gu}")
-                return f"{current_do} {current_si_gu}".strip()
-            
-            # [전략 B] 둘 다 있는 완벽한 결과가 없을 경우를 대비해, 정보를 모아둠 (백업)
-            if not best_do and current_do:
-                best_do = current_do
-            if not best_si_gu and current_si_gu:
-                best_si_gu = current_si_gu
-
-        # 반복문을 다 돌았는데도 완벽한 세트가 없으면, 모아둔 정보라도 조합해서 반환
-        final_result = f"{best_do} {best_si_gu}".strip()
-        print(f"DEBUG: ⚠️ 완벽한 매칭 실패. 조합된 결과 사용: {final_result}")
+        print(f"DEBUG: ✅ 좌표 -> 행정구역 변환 성공: {final_result}")
         return final_result
 
     except Exception as e:
@@ -203,52 +199,41 @@ final_generation_chain = (
 def get_location_admin_area(place_name: str) -> str:
     """
     장소 이름(예: 신라호텔)을 받아 행정 구역(예: 제주특별자치도 서귀포시)을 반환합니다.
+    [수정] get_coordinates와 get_admin_district_from_coords를 조합하여 안정성 향상.
     """
     if not GMAPS_CLIENT or not place_name:
         return ""
     
     try:
-        # 구글 지오코딩 API 호출
-        geocode_result = GMAPS_CLIENT.geocode(place_name, language='ko')
+        # 1. 장소 이름으로 좌표 획득
+        lat, lng = get_coordinates(place_name)
         
-        if not geocode_result:
+        if lat and lng:
+            # 2. 좌표로 행정구역 획득 (이미 개선된 함수 사용)
+            admin_area = get_admin_district_from_coords(lat, lng)
+            print(f"DEBUG: '{place_name}'의 위치 파악 -> {admin_area}")
+            return admin_area
+        else:
+            print(f"DEBUG: '{place_name}'의 좌표를 찾지 못해 위치 파악 실패")
             return ""
-            
-        # 주소 컴포넌트 분석
-        # (format: '제주특별자치도 서귀포시 중문관광로72번길 75')
-        address_components = geocode_result[0].get('address_components', [])
-        
-        admin_area_1 = "" # 도/광역시 (예: 제주특별자치도)
-        locality = ""     # 시/군/구 (예: 서귀포시)
-        sublocality = ""  # 동/읍/면 (예: 색달동)
-        
-        for component in address_components:
-            types = component.get('types', [])
-            if 'administrative_area_level_1' in types:
-                admin_area_1 = component['long_name']
-            elif 'locality' in types:
-                locality = component['long_name']
-            elif 'sublocality_level_1' in types or 'sublocality' in types:
-                sublocality = component['long_name']
-        
-        # 가장 구체적인 지역 정보를 조합하여 반환
-        # 예: "서귀포시 색달동" 또는 "제주특별자치도 서귀포시"
-        region_info = f"{admin_area_1} {locality} {sublocality}".strip()
-        print(f"DEBUG: '{place_name}'의 위치 파악 -> {region_info}")
-        return region_info
 
     except Exception as e:
         print(f"DEBUG: 위치 파악 중 오류: {e}")
         return ""
 
 @tool
-def search_attractions_and_reviews(query: str, destination: str = "", start_location: str = "") -> str:
+def search_attractions_and_reviews(query: str, destination: str = "", anchor: str = "") -> str:
     """
     관광지/맛집 정보를 검색합니다.
     Google Maps를 활용해 지명(POI)을 정확한 행정구역으로 변환합니다.
-    만약 출발지가 있다면, 출발지의 지역 정보를 활용해 목적지의 모호성을 해결합니다.
+    만약 출발지(anchor)가 있다면, 그 지역 정보를 활용해 목적지의 모호성을 해결합니다.
     """
+    # 💡 [매핑] GraphFlow에서는 'anchor'라는 이름으로 현재 위치를 넘겨줍니다.
+    # 사용자가 제공한 로직의 'start_location' 역할을 'anchor'가 수행합니다.
+    start_location = anchor 
+
     print(f"\n--- [DEBUG] search_attractions_and_reviews 호출 ---")
+    print(f"DEBUG: Input -> query='{query}', dest='{destination}', anchor='{start_location}'")
 
     # 1. 초기 타겟 설정
     target_location = destination
@@ -285,6 +270,10 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
                     else:
                         print(f"DEBUG: 💡 모호한 지명 보정: '{destination}' + 출발지('{start_province}')")
                         target_location = f"{start_province} {destination}"
+                else:
+                    # 3글자 초과면 그냥 붙임 (안전책)
+                    if start_province not in destination:
+                        target_location = f"{start_province} {destination}"
 
     if not target_location and start_location:
          target_location = get_location_admin_area(start_location)
@@ -302,10 +291,11 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
 
     if lat and lng:
         # 좌표 -> 행정구역 변환 (이제 부산진구 부전동 쪽 행정구역이 나올 것임)
-        standardized_region = get_admin_district_from_coords(lat, lng) # 아까 만든 스마트 머지 함수 사용
+        standardized_region = get_admin_district_from_coords(lat, lng) 
         print(f"DEBUG: 🔄 표준화 변환: '{target_location}' -> '{standardized_region}'")
 
     final_region_filter = standardized_region if standardized_region else target_location
+    
     # 내부 검색 함수 정의
     def run_search(region_filter, use_filter=True):
         try:
@@ -318,12 +308,11 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
             if use_filter and region_filter:
                 # 필터 적용 검색
                 retriever = RegionPreFilteringRetriever(
-                    vectorstore=DB, k=5, fixed_location=region_filter
+                    vectorstore=DB, k=15, fixed_location=region_filter
                 )
                 print(f"DEBUG: 🔍 필터 검색 실행 (필터: {region_filter})")
             else:
-                # 필터 미적용 (전체 검색) - retriever 대신 직접 vectorstore 사용이 나을 수 있음
-                # 여기서는 필터값 None으로 주어 필터링 패스 유도
+                # 필터 미적용 (전체 검색)
                 retriever = RegionPreFilteringRetriever(
                     vectorstore=DB, k=5, fixed_location=None
                 )
@@ -342,15 +331,13 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
         print(f"DEBUG: 🚨 정밀 검색 결과 없음. Fallback(전체 검색) 시도...")
 
         # 필터 없이 검색하되, 쿼리에 지역명을 강력하게 포함시켜야 함
-        # 예: 필터 없이 "카페"만 찾으면 안됨 -> "광안리 카페"로 찾아야 함
         docs = run_search(target_location, use_filter=False)
 
         if docs:
              # 🚨 [수정 2] Fallback 검증 개선
-             # page_content뿐만 아니라 metadata['지역']도 확인
              filtered_fallback = []
              for d in docs:
-                 # 원본 지명(예: "우도")이나 표준화된 지역명(예: "제주시") 중 하나라도 포함되면 통과
+                 # 원본 지명이나 표준화된 지역명 중 하나라도 포함되면 통과
                  content_match = (
                      (original_destination and original_destination in d.page_content) or
                      target_location in d.page_content
@@ -372,7 +359,7 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
 
     # 5. 결과 반환
     if not docs:
-        return f"'{target_location}'에 대한 정보를 찾을 수 없습니다."
+        return f"'{target_location}' 근처에서 '{query}' 관련 정보를 찾을 수 없습니다."
 
     unique_docs = []
     seen = set()
@@ -381,16 +368,17 @@ def search_attractions_and_reviews(query: str, destination: str = "", start_loca
             unique_docs.append(doc)
             seen.add(doc.page_content)
     
-    context_str = format_docs(unique_docs)
+    # 상위 5~7개 정도만 사용
+    final_docs = unique_docs[:7]
+    context_str = format_docs(final_docs)
     
     input_for_final_chain = {
         "context": f"검색 기준 지역: {final_region_filter}\n{context_str}", 
-        "question": query
+        "question": f"현재 위치는 '{start_location}'입니다. 이 근처의 '{query}' 관련 장소를 추천해줘."
     }
     final_result = final_generation_chain.invoke(input_for_final_chain)
     
     return final_result
-
 
 
 @tool
@@ -778,6 +766,152 @@ def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
         return f"오류: 스케줄 생성 실패 ({e})"
     
 
+@tool
+def find_and_select_best_place(query: str, destination: str, anchor: str, exclude_places: List[str] = []) -> str:
+    """
+    [통합 도구]
+    1. search_attractions_and_reviews를 호출하여 후보 장소를 검색합니다.
+    2. 검색 결과에서 장소 이름들을 파싱합니다.
+    3. 이미 방문한 장소(exclude_places)를 후보에서 제외합니다.
+    4. select_best_place를 호출하여 가장 가까운 최적 장소를 선정합니다.
+    """
+    print(f"\n--- [DEBUG] find_and_select_best_place 호출 ---")
+    print(f"DEBUG: Input -> query='{query}', dest='{destination}', anchor='{anchor}', exclude='{exclude_places}'")
+
+    # 1. 검색 수행
+    search_result = search_attractions_and_reviews.invoke({
+        "query": query,
+        "destination": destination,
+        "anchor": anchor
+    })
+    
+    print(f"DEBUG: 검색 결과:\n{search_result}")
+
+    # 2. 후보 장소 파싱 (강화된 로직)
+    candidates = []
+    pattern1 = r"\d+\.\s*(?:\*\*)?([^\:\n\*]+)(?:\*\*)?" 
+    matches1 = re.findall(pattern1, str(search_result))
+    
+    if matches1:
+        candidates.extend([m.strip() for m in matches1])
+    else:
+        pattern2 = r"-\s*(?:\*\*)?([^\:\n\*]+)(?:\*\*)?"
+        matches2 = re.findall(pattern2, str(search_result))
+        if matches2:
+            candidates.extend([m.strip() for m in matches2])
+
+    candidates = list(set([c for c in candidates if c]))
+
+    if not candidates:
+        return f"검색 결과에서 장소명을 추출하지 못했습니다. 원본 결과: {search_result[:100]}..."
+
+    print(f"DEBUG: 추출된 후보({len(candidates)}개): {candidates}")
+
+    # 3. [수정] 이미 방문한 장소 제외
+    if exclude_places:
+        print(f"DEBUG: 제외 전 후보: {candidates}")
+        candidates = [c for c in candidates if c not in exclude_places]
+        print(f"DEBUG: 제외 후 후보: {candidates}")
+
+    if not candidates:
+        return "더 이상 추천할 새로운 장소가 없습니다. 다른 종류의 장소를 검색해보세요 (예: '카페' 또는 '관광지')."
+
+    # 4. 최적 장소 선정 (거리 계산)
+    try:
+        selection_json = select_best_place.invoke({
+            "origin": anchor,
+            "candidates": candidates
+        })
+        selection_data = json.loads(selection_json)
+        
+        result_data = {
+            "name": selection_data.get("name"),
+            "transport": selection_data.get("transport"),
+            "duration": selection_data.get("duration"),
+            "description": f"({anchor} 근처) {query} 추천 장소" 
+        }
+        
+        return json.dumps(result_data, ensure_ascii=False)
+
+    except Exception as e:
+        print(f"ERROR: 최적 장소 선정 중 오류: {e}")
+        return f"오류 발생: {e}"
+
+@tool
+def select_best_place(origin: str, candidates: List[str]) -> str:
+    """
+    [기능] 현재 위치(origin)에서 후보지(candidates)들까지의 거리/시간을 계산하여,
+    가장 이동 시간이 짧은 최적의 장소 1곳을 선정해 반환합니다.
+    [반환] JSON 문자열: {"name": "장소명", "duration": "15분", "transport": "대중교통"}
+    """
+    if not candidates:
+        return "오류: 후보지 목록이 비어있습니다."
+    
+    print(f"\n--- [DEBUG] 거리 비교 시작 ---")
+    print(f"📍 출발: {origin}")
+    print(f"❓ 후보: {candidates}")
+
+    # GMAPS_CLIENT가 없거나 에러 시 Fallback (첫 번째 후보 선택)
+    if not GMAPS_CLIENT:
+        print("DEBUG: GMAPS_CLIENT 없음. 첫 번째 후보 선택.")
+        return json.dumps({
+            "name": candidates[0],
+            "duration": "정보 없음",
+            "transport": "이동"
+        }, ensure_ascii=False)
+
+    try:
+        # Distance Matrix API 호출 (대중교통 기준)
+        matrix = GMAPS_CLIENT.distance_matrix(
+            origins=[origin],
+            destinations=candidates,
+            mode="transit",
+            language="ko"
+        )
+        
+        best_candidate = None
+        min_seconds = float('inf')
+        best_info = {}
+
+        # 결과 분석
+        rows = matrix.get('rows', [])
+        if rows:
+            elements = rows[0].get('elements', [])
+            for idx, el in enumerate(elements):
+                status = el.get('status')
+                candidate_name = candidates[idx]
+                
+                if status == 'OK':
+                    duration_value = el['duration']['value'] # 초 단위
+                    duration_text = el['duration']['text']
+                    
+                    print(f"   - {candidate_name}: {duration_text}")
+                    
+                    if duration_value < min_seconds:
+                        min_seconds = duration_value
+                        best_candidate = candidate_name
+                        best_info = {
+                            "name": candidate_name,
+                            "duration": duration_text,
+                            "transport": "대중교통" # API 모드에 따라 변경 가능
+                        }
+        
+        if best_candidate:
+            print(f"✅ 최적 선택: {best_candidate} ({best_info['duration']})")
+            return json.dumps(best_info, ensure_ascii=False)
+        else:
+            # 경로를 못 찾은 경우
+            return json.dumps({
+                "name": candidates[0],
+                "duration": "경로 없음",
+                "transport": "도보/택시"
+            }, ensure_ascii=False)
+
+    except Exception as e:
+        print(f"ERROR: 거리 계산 실패 - {e}")
+        return json.dumps({"name": candidates[0], "duration": "계산 오류", "transport": "?"}, ensure_ascii=False)
+
+
 # 도구 목록 등록
-TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes, plan_itinerary_timeline]
+TOOLS = [search_attractions_and_reviews, get_weather_forecast, optimize_and_get_routes, plan_itinerary_timeline, select_best_place, find_and_select_best_place]
 AVAILABLE_TOOLS = {tool.name: tool for tool in TOOLS}

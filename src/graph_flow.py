@@ -10,300 +10,251 @@ from src.tools import AVAILABLE_TOOLS, TOOLS
 import re 
 import json
 
-from langgraph.checkpoint.memory import MemorySaver 
-
-CHECKPOINTER = MemorySaver()
-
+# --- 헬퍼 함수 ---
 def normalize_content_to_str(content: Any) -> str:
     if content is None: return ""
     if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text": parts.append(str(part["text"]))
-            else: parts.append(str(part))
-        return "\n".join(parts)
-    if isinstance(content, dict): return json.dumps(content, ensure_ascii=False)
+        return "\n".join([str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content])
     return str(content)
+
+def clean_json_text(text: str) -> str:
+    text = text.strip()
+    match = re.search(r"```(json)?\s*(.*)\s*```", text, re.DOTALL)
+    if match: return match.group(2).strip()
+    return text
 
 # --- 1. 상태 정의 ---
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    current_weather: str
-    itinerary: List[Dict]
     destination: str
-    start_location: str  
     dates: str
-    preference: str
     total_days: int
     activity_level: int
+    preference: str
+    current_weather: str
+    itinerary: List[Dict]
     current_planning_day: int
-    show_pdf_button: bool
-    next_node: Literal["InfoCollectorAgent", "WeatherAgent", "AttractionAgent", "RestaurantAgent", "DayTransitionAgent", "ConfirmationAgent", "PDFCreationAgent", "end_node"]
+    show_pdf_button: bool 
+    current_anchor: str 
 
-# --- 2. 전문 에이전트 정의 ---
+# --- 2. 에이전트 생성 팩토리 ---
 def create_specialist_agent(system_prompt: str):
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("placeholder", "{messages}")])
     llm_with_tools = LLM.bind_tools(TOOLS)
     chain = prompt | llm_with_tools
+    
     def agent_node(state: AgentState):
+        # 1. 진행 상황 계산
+        total_days = state.get('total_days', 1)
+        activity_level = state.get('activity_level', 3)
+        itinerary = state.get('itinerary', [])
+        
+        day_counts = {d: 0 for d in range(1, total_days + 1)}
+        for item in itinerary:
+            if item.get('type') != 'move':
+                day = item.get('day')
+                if day and isinstance(day, int) and day in day_counts:
+                    day_counts[day] += 1
+
+        target_day = 1
+        all_finished = True
+        progress_report = []
+        for d in range(1, total_days + 1):
+            count = day_counts[d]
+            status = "완료" if count >= activity_level else f"진행 중 ({count}/{activity_level})"
+            progress_report.append(f"- {d}일차: {count}/{activity_level}곳 ({status})")
+            if count < activity_level and all_finished:
+                all_finished = False
+                target_day = d
+        
+        # 2. 상태 메시지 생성
+        weather_info = state.get('current_weather')
+        if not weather_info:
+            goal_msg = "【긴급】 날씨 정보가 없습니다! 가장 먼저 `get_weather_forecast` 도구를 사용하세요."
+        elif all_finished:
+            goal_msg = "【모든 일정 완료!】 `plan_itinerary_timeline`을 호출하여 최종 일정을 정리하세요."
+        else:
+            goal_msg = f"【현재 목표: {target_day}일차 계획 수립】 다음 장소를 추천해주세요."
+
+        itinerary_summary = [f"- {item.get('type', '장소')}: {item.get('name', '이름모름')}" for item in itinerary]
+
         state_summary = f"""
---- 현재 계획 상태 ---
-날씨: {state.get('current_weather', '아직 모름')}
-전체 확정 일정: {state.get('itinerary', [])}
-여행지: {state.get('destination', '아직 모름')}
-날짜: {state.get('dates', '아직 모름')}
-취향: {state.get('preference', '아직 모름')}
-총 여행일: {state.get('total_days', 1)}일
-하루 목표 활동량: {state.get('activity_level', 3)}곳
-현재 계획 중인 날짜: {state.get('current_planning_day', 1)}일차
----
+--- [시스템 현황판 (최신)] ---
+1. 여행지: {state.get('destination')} ({state.get('dates')})
+2. 날씨 정보: {weather_info if weather_info else "❌ 없음 (즉시 조회 필요)"}
+3. 진행 상황:
+{chr(10).join(progress_report)}
+4. 현재까지의 일정:
+{chr(10).join(itinerary_summary)}
+5. 현재 상태: {goal_msg}
+6. 현재 앵커: {state.get('current_anchor', '출발지')}
+-----------------------------
 """
-        current_messages = [HumanMessage(content=state_summary)] + state['messages']
+        current_messages = state['messages'] + [HumanMessage(content=state_summary)]
+        
         response = chain.invoke({"messages": current_messages})
         
-        itinerary = state.get('itinerary', []).copy()
-        content = normalize_content_to_str(getattr(response, "content", ""))
-
-        final_itinerary_match = re.search(r"\[FINAL_ITINERARY_JSON\](.*)\[/FINAL_ITINERARY_JSON\]", content, re.DOTALL)
-        if final_itinerary_match:
-            try:
-                itinerary = json.loads(final_itinerary_match.group(1).strip())
-                print(f"DEBUG: SupervisorAgent가 최종 정리한 itinerary:\n{itinerary}")
-            except Exception as e:
-                print(f"ERROR: JSON 파싱 실패: {e}")
-
-        match = re.search(r"'(.*?)'을/를 (\d+)일차 (관광지|식당|카페) 계획에 추가합니다", content)
-        if match:
-            name, day, type = match.groups()
-            new_item = {'day': int(day), 'type': type, 'name': name, 'description': ''}
-            if new_item not in itinerary:
-                itinerary.append(new_item)
-                print(f"DEBUG: 장소 추가됨 - {name} (Day {day}, {type})")
-
-        show_pdf_button = state.get('show_pdf_button', False)
-        if "[STATE_UPDATE: show_pdf_button=True]" in content: show_pdf_button = True
-
-        return {"messages": [response], "itinerary": itinerary, "show_pdf_button": show_pdf_button}
+        # 🚨 [수정] agent_node는 더 이상 상태를 직접 수정하지 않음. 도구 호출에만 집중.
+        return {"messages": [response]}
+    
     return agent_node
 
-# --- 3. Supervisor (라우터) 정의 ---
+# --- 3. 프롬프트 (최종 수정) ---
+supervisor_prompt = """당신은 주어진 현황판을 분석하여 다음 행동을 결정하는 '지능형 여행 계획 슈퍼바이저'입니다.
+
+### 🚀 실행 절차
+
+**1. [우선순위 1] 날씨 확인:**
+- '현황판'에 **날씨 정보가 없다면**, 다른 어떤 작업보다 먼저 `get_weather_forecast`를 호출하여 날씨 정보를 가져오세요.
+
+**2. [우선순위 2] 계획 수립:**
+- '현황판'의 '진행 상황'을 보고, 아직 **목표치를 채우지 못한 날**이 있는지 확인하세요.
+- **만약 그런 날이 있다면, 해당 날짜(N일차)와 현재 채워진 일정 수에 따라 다음 규칙으로 `find_and_select_best_place`를 단 한 번 호출하세요:**
+
+    **A. 1일차인 경우 (시작 시간 12:00 가정):**
+    - **첫 번째 장소 (점심):** 무조건 **'맛집'**을 검색하세요.
+    - **두 번째 장소:** 사용자의 선호가 '맛집 탐방'이라면 **'카페'**를, 아니라면 **'관광지'**를 검색하세요.
+    - **세 번째 장소:**
+        - 만약 이 날의 목표 일정 수가 4개 이상이라면: **'관광지'**를 검색하세요.
+        - 그 외의 경우: 바로 저녁 식사를 위해 **'맛집'**을 검색하세요.
+    - **네 번째 장소 (저녁):** 세 번째 장소에서 '관광지'를 갔다면, 이번에는 **'맛집'**을 검색하세요.
+    - **다섯 번째 이후 (남은 일정):** 아직 목표치를 못 채웠다면 **'관광지'**를 검색하세요.
+
+    **B. 중간 날짜 (1일차 아님 & 마지막 날 아님):**
+    - **첫 번째 장소 (오전):** 무조건 **'관광지'**를 먼저 하나 검색하세요.
+    - **두 번째 장소부터:** 1일차의 로직(점심 맛집 -> 선호에 따른 2번째 장소 -> ...)을 동일하게 따르세요.
+
+    **C. 마지막 날인 경우:**
+    - 활동량이나 다른 조건에 상관없이, 앵커(숙소 또는 거점) 근처의 **'맛집'**을 하나 검색하여 일정을 마무리하세요.
+
+**3. [우선순위 3] 검색 실패 시 대처:**
+- 만약 `find_and_select_best_place` 도구 호출 결과가 "더 이상 추천할 새로운 장소가 없습니다"와 같은 실패 메시지라면, **같은 종류의 장소를 다시 검색하지 마세요.**
+- 대신, **다른 종류의 장소를 검색**하세요. (예: '관광지' 검색 실패 시 '카페' 또는 '공원' 검색)
+- 여러 종류를 시도해도 계속 장소를 찾지 못하면, 그 날의 계획을 중단하고 `plan_itinerary_timeline` 도구를 호출하여 현재까지의 일정으로 최종 정리를 시작하세요.
+
+**4. [우선순위 4] 최종 정리:**
+- '진행 상황'의 **모든 날짜가 목표를 달성했다면**, `plan_itinerary_timeline` 도구를 호출하여 전체 일정을 시간순으로 정리하고 최종 결과를 만드세요.
+"""
+SupervisorAgent = create_specialist_agent(supervisor_prompt)
+
+# --- 4. 라우터 ---
 def supervisor_router(state: AgentState):
-    print("--- (Supervisor) 다음 작업 결정 ---")
-    print(f"DEBUG: 현재 계획 중인 날짜 = {state.get('current_planning_day', 1)}일차")
+    return "SupervisorAgent"
 
-    if not state.get('messages') or not state['messages']: return "InfoCollectorAgent"
+def supervisor_loop_router(state: AgentState):
     last_message = state['messages'][-1]
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        return "call_tools"
+    if "[FINAL_ITINERARY_JSON]" in normalize_content_to_str(last_message.content):
+        return END
     
-    # 1. ToolMessage 우선 처리 (브리핑)
-    if isinstance(last_message, ToolMessage):
-        print("Router -> SupervisorAgent (ToolMessage 결과 브리핑 요청)")
-        return "SupervisorAgent" 
-
-    # 2. 필수 정보 확인
-    required_info = ['destination', 'dates', 'total_days', 'activity_level']
-    if not all(state.get(key) for key in required_info): return "InfoCollectorAgent"
-    if not state.get('current_weather'): return "WeatherAgent"
-
-    # 3. [다음 턴 로직] 날씨/취향 완료 후 '다음 대화'가 들어오면 식당 추천으로 연결
-    # (이번 턴은 END로 끝나서 사용자 입력을 기다리고, 사용자가 말하면 이 로직이 작동함)
-    if state.get('current_weather') and state.get('preference') and not state.get('itinerary'):
-        # 사용자가 날씨 브리핑을 듣고 "좋아", "추천해줘" 등 반응을 보이면 바로 식당 추천 시작
-        print("Router -> RestaurantAgent (날씨/취향 확인됨 -> 식당 추천 시작)")
-        return "RestaurantAgent"
+    # 추가적인 종료 조건: 모든 계획이 완료되었는지 명시적으로 확인
+    total_days = state.get('total_days', 1)
+    activity_level = state.get('activity_level', 3)
+    itinerary = state.get('itinerary', [])
+    day_counts = {d: 0 for d in range(1, total_days + 1)}
+    for item in itinerary:
+        if item.get('type') != 'move':
+            day = item.get('day')
+            if day and isinstance(day, int) and day in day_counts:
+                day_counts[day] += 1
     
-    # 4. 하루 목표 및 전환
-    current_day = state.get("current_planning_day", 1)
-    activity_level = state.get("activity_level", 3)
-    places_for_current_day = [p for p in state.get("itinerary", []) if p.get('day') == current_day]
-
-    if len(places_for_current_day) >= activity_level:
-        if current_day < state.get("total_days", 1): return "DayTransitionAgent"
-        else: return "ConfirmationAgent"
-            
-    # 5. 대화 기반 라우팅
-    if isinstance(last_message, HumanMessage):
-        content = last_message.content.lower()
-        if any(k in content for k in ["pdf", "파일", "정리"]): return "SupervisorAgent"
-        if any(k in content for k in ["최적화", "순서", "경로"]): return "SupervisorAgent"
-        if any(k in content for k in ["식당", "맛집", "카페", "먹고"]): return "RestaurantAgent"
-        if any(k in content for k in ["관광", "장소", "구경"]): return "AttractionAgent"
+    if all(count >= activity_level for count in day_counts.values()) and itinerary:
+        # 최종 정리를 위해 다시 SupervisorAgent로 가서 plan_itinerary_timeline을 호출하게 함
+        return "SupervisorAgent"
 
     return "SupervisorAgent"
 
-# --- 4. 에이전트 생성 ---
-pdf_creation_prompt = "당신은 'PDF 문서 생성 전문가'입니다. 여행 계획이 완료되면 사용자에게 PDF 다운로드 버튼을 안내하세요. 응답 끝에 [STATE_UPDATE: show_pdf_button=True]를 포함하세요."
-PDFCreationAgent = create_specialist_agent(pdf_creation_prompt)
-
-supervisor_prompt = """당신은 AI 여행 플래너 팀의 '슈퍼바이저'입니다.
-
-### 핵심 규칙 (반드시 준수)
-1. **PDF 요청 거절 금지:** 사용자가 "PDF 줘", "다운로드 할래"라고 하면 **절대로 "못한다"고 말하지 마세요.** 당신은 시스템과 연결되어 있어 PDF를 생성할 수 있습니다.
-2. **즉시 JSON 생성:** PDF 요청 시, 즉시 아래 정의된 `[FINAL_ITINERARY_JSON]` 형식으로 데이터를 출력하세요. 이 코드가 출력되어야 버튼이 생깁니다.
-3. **버튼 활성화 태그 필수:** 다운로드 요청 시 반드시 답변 끝에 `[STATE_UPDATE: show_pdf_button=True]` 태그를 포함해야 버튼이 생성됩니다.
-4. 2. **날씨 정보 정리:** 여행 계획 출력 시, 날씨 정보는 raw 데이터 대신 "최고 기온 X도, 맑음" 등 사람이 읽기 좋은 형식으로 요약하여 언급하십시오.
-
-### 주요 임무
-1.  **계획 추가 확인 (🚨중요🚨):** 장소 선택 시 반드시 **현재 상태의 '현재 계획 중인 날짜' 값**을 사용하여 "네, [장소명]을 [현재 계획 중인 날짜]일차 [유형]에 추가합니다."라고 명확히 응답하세요.
-   - 예: 상태가 "현재 계획 중인 날짜: 2일차"라면 → "네, 국수마루를 2일차 식당 계획에 추가합니다."
-   - **절대로 항상 "1일차"라고 하지 마세요.** 상태 정보를 정확히 읽어서 사용하십시오.
-2. **하루 단위 경로 최적화:** 사용자가 경로 최적화를 요청하면, `itinerary`에 있는 장소들과 **현재 상태의 `start_location`을 인자로 전달**하여 `optimize_and_get_routes` 도구를 호출하세요.3.  **도구 결과 브리핑:** 검색 결과는 반드시 목록 형태로 요약하여 전달하세요.
-4.  **날씨 브리핑:** 날씨 정보를 받으면 "[온도/하늘상태]이므로 [추천활동] 어떠세요?" 형태로 제안하세요.
-5. **PDF 생성 및 다운로드 (★★가장 중요★★):**
-   사용자가 다운로드를 요청하거나, 최종 일정 확정을 요청하면 **절대로 다음 단계들을 건너뛰지 마세요.**
-   
-   A. **시간 계산 강제 호출 (필수):** `plan_itinerary_timeline` 도구를 호출하여 현재의 일정(`itinerary` 리스트)에 **실제 이동 시간이 반영된 타임라인 JSON**을 획득하세요.
-   B. **JSON 출력:** 도구의 결과로 받은, **시간과 이동 정보가 계산된 JSON**을 아래 `[FINAL_ITINERARY_JSON]` 블록 안에 넣으세요.
-   C. **버튼 활성화 (필수):** 답변 맨 마지막에 `[STATE_UPDATE: show_pdf_button=True]` 태그를 포함하세요.    
-    [FINAL_ITINERARY_JSON]
-    [
-      {{"day": 1, "type": "관광지", "name": "장소명", "description": "한 줄 특징"}},
-      {{"day": 1, "type": "식당", "name": "식당명", "description": "추천 메뉴"}}
-    ]
-    [/FINAL_ITINERARY_JSON]
-    3. **버튼 트리거 태그 (필수):**
-      `[STATE_UPDATE: show_pdf_button=True]`
-   
-   **예시 답변:**
-   "1일차 일정이 확정되었습니다. PDF를 생성해 드립니다.
-   [FINAL_ITINERARY_JSON]...[/FINAL_ITINERARY_JSON]
-   [STATE_UPDATE: show_pdf_button=True]"
-
-    
-    출력 후: "여행 계획을 정리했습니다. 아래 버튼을 눌러 PDF로 다운로드하세요."라고 말하세요.
-"""
-
-
-SupervisorAgent = create_specialist_agent(supervisor_prompt)
-
-def day_transition_agent_node(state: AgentState):
-    prompt = f"당신은 '플랜 전환 안내자'입니다. {state.get('current_planning_day')}일차 목표를 달성했습니다. 다음 날로 넘어갈까요? 응답 끝에 [STATE_UPDATE: increment_day=True]를 포함하세요."
-    response = LLM.invoke(prompt)
-    return {"messages": [response]}
-DayTransitionAgent = day_transition_agent_node
-
-confirmation_prompt = "당신은 '일정 확인 전문가'입니다. 모든 계획이 완료되었습니다. 이대로 확정할까요?"
-ConfirmationAgent = create_specialist_agent(confirmation_prompt)
-
-infocollector_prompt = "당신은 '정보 수집가'입니다. 목적지, 날짜, 인원, 스타일을 파악하세요."
-InfoCollectorAgent = create_specialist_agent(infocollector_prompt)
-
-attraction_prompt = """당신은 '관광지 전문가'입니다.
-당신의 임무는 사용자의 요청을 분석하여 즉시 관광지 후보를 검색하는 것입니다.
-
-### 행동 지침:
-1. **즉시 검색:** 사용자의 말에 **'~근처', 지역명, 또는 구체적인 활동(바다 구경 등)**이 포함되어 있다면, **되묻지 말고 즉시** `search_attractions_and_reviews` 도구를 호출하세요.
-2. **정보 부족 시에만 질문:** 사용자가 단순히 "관광지 추천해줘"라고만 했을 때만 "어떤 스타일의 관광지를 원하시나요?"라고 질문하세요.
-3. **도구 호출:** `preference`와 `start_location`(출발지)을 고려하여 검색 쿼리를 구체적으로 만드세요. (예: "부산역 근처 바다 구경")
-4. **계획 추가 시 (중요):** 장소를 추천하고 사용자가 선택하면, 반드시 **현재 상태의 '현재 계획 중인 날짜' 값**을 확인하여 해당 날짜에 추가한다고 말하세요.
-   - 예: "네, [장소명]을 [현재 계획 중인 날짜]일차 관광지 계획에 추가합니다."
-"""
-AttractionAgent = create_specialist_agent(attraction_prompt)
-
-restaurant_prompt = """당신은 '식당 전문가'입니다.
-당신의 임무는 사용자의 요청을 분석하여 즉시 식당 후보를 검색하는 것입니다.
-
-### 행동 지침:
-1. **즉시 검색:** 사용자의 말에 **'~근처', 지역명, 메뉴 이름(회, 국밥 등)**이 포함되어 있다면, **"찾아볼까요?"라고 되묻지 말고 즉시** `search_attractions_and_reviews` 도구를 호출하세요.
-2. **정보 부족 시에만 질문:** 사용자가 단순히 "밥 먹을래"라고만 했을 때만 "어떤 메뉴를 원하시나요?"라고 질문하세요.
-3. **도구 호출:** `preference`와 `start_location`(출발지)을 고려하여 검색 쿼리를 구체적으로 만드세요. (예: "부산역 근처 횟집 추천")
-4. **계획 추가 시 (중요):** 식당을 추천하고 사용자가 선택하면, 반드시 **현재 상태의 '현재 계획 중인 날짜' 값**을 확인하여 해당 날짜에 추가한다고 말하세요.
-   - 예: "네, [식당명]을 [현재 계획 중인 날짜]일차 식당 계획에 추가합니다."
-"""
-RestaurantAgent = create_specialist_agent(restaurant_prompt)
-
-weather_prompt = """당신은 '날씨 분석가'입니다.
-
-### 행동 지침:
-1. **도구 호출:** `get_weather_forecast` 도구를 호출하여 날씨 정보를 가져오세요.
-2. **결과 브리핑:** 도구 결과를 받으면, **각 시간대별 날씨를 목록 형태로 줄바꿈하여** 사용자에게 전달하세요.
-   - 잘못된 예: "09시 15도 맑음, 12시 18도 구름 많음..." (한 줄로 나열)
-   - 올바른 예:
-     ```
-     제주도 날씨 예보입니다:
-     - 09:00: 15.0℃, 맑음
-     - 12:00: 18.0℃, 구름 많음
-     - 15:00: 20.0℃, 맑음
-     ```
-3. **간단한 요약 추가:** 날씨 정보 뒤에 "[온도/하늘상태]이므로 [추천활동] 어떠세요?" 형태로 제안하세요.
-"""
-WeatherAgent = create_specialist_agent(weather_prompt)
-
-# --- 5. 도구 실행 노드 ---
-def call_tools(state: AgentState):
+# --- 5. 도구 노드 & 그래프 ---
+def call_tools_node(state: AgentState):
     last_message = state['messages'][-1]
-    if not isinstance(last_message, AIMessage) or not last_message.tool_calls: return {}
-    tool_messages = []
+    results = []
+    
+    # 수정 가능한 상태 복사본
+    new_itinerary = state.get('itinerary', []).copy()
+    new_anchor = state.get('current_anchor')
     weather_update = state.get('current_weather')
-    for tool_call in last_message.tool_calls:
-        tool_name = tool_call["name"]
-        tool_to_call = AVAILABLE_TOOLS.get(tool_name)
-        if tool_to_call:
+    show_pdf = state.get('show_pdf_button', False)
+
+    # 현재 계획 중인 날짜를 가져옴
+    total_days = state.get('total_days', 1)
+    activity_level = state.get('activity_level', 3)
+    target_day = 1
+    for d in range(1, total_days + 1):
+        count = sum(1 for item in new_itinerary if item.get('day') == d and item.get('type') != 'move')
+        if count < activity_level:
+            target_day = d
+            break
+
+    for t in last_message.tool_calls:
+        tool_name = t.get("name")
+        if tool_name in AVAILABLE_TOOLS:
             try:
-                output = tool_to_call.invoke(tool_call["args"])
-                if tool_name == "get_weather_forecast": weather_update = output
-            except Exception as e: output = f"Error: {e}"
-        else: output = "Error: Tool not found"
-        print(f"\n--- [DEBUG] Tool Output ({tool_name}): {str(output)[:200]}...")
-        tool_messages.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
-    return {"messages": tool_messages, "current_weather": weather_update}
+                args = t.get("args", {})
+                
+                if tool_name == "find_and_select_best_place":
+                    args['exclude_places'] = [item['name'] for item in new_itinerary if 'name' in item]
+                    if not args.get('anchor'):
+                        args['anchor'] = new_anchor or state.get('destination')
+                
+                elif tool_name == "plan_itinerary_timeline":
+                    args['itinerary'] = new_itinerary
 
-# --- 6. 라우터 및 그래프 빌드 ---
+                res = AVAILABLE_TOOLS[tool_name].invoke(args)
+                output = str(res)
+                
+                # [수정] 도구 결과에 따른 상태 업데이트 로직
+                if tool_name == "find_and_select_best_place":
+                    try:
+                        item_json = json.loads(output)
+                        if not any(x.get('name') == item_json.get('name') for x in new_itinerary):
+                            # 타입 추론 추가
+                            if 'type' not in item_json:
+                                if any(kw in item_json.get('description', '') for kw in ['맛집', '식당', '카페']):
+                                     item_json['type'] = '맛집'
+                                else:
+                                     item_json['type'] = '관광지'
+                            
+                            item_json['day'] = target_day # 올바른 목표일차 설정
+                            new_itinerary.append(item_json)
+                            new_anchor = item_json.get('name')
+                            print(f"DEBUG: [ADD BY TOOL] {new_anchor} to Day {target_day}")
+                    except (json.JSONDecodeError, KeyError) as e:
+                        print(f"DEBUG: [TOOL ERROR] find_and_select_best_place 결과 처리 실패: {e}, 원본: {output}")
 
-def expert_router(state: AgentState):
-    last_message = state['messages'][-1]
+                elif tool_name == "plan_itinerary_timeline":
+                    try:
+                        new_itinerary = json.loads(output)
+                        show_pdf = True 
+                        print("DEBUG: [FINAL] 최종 타임라인 생성 완료")
+                    except json.JSONDecodeError:
+                        print(f"DEBUG: [TOOL ERROR] plan_itinerary_timeline 결과가 JSON이 아님: {output}")
+
+                elif tool_name == 'get_weather_forecast':
+                    weather_update = output
+                    
+                results.append(ToolMessage(tool_call_id=t['id'], content=output))
+            except Exception as e:
+                print(f"ERROR in tool {tool_name}: {e}")
+                results.append(ToolMessage(tool_call_id=t['id'], content=f"Error: {e}"))
     
-    if isinstance(last_message, AIMessage):
-        content = last_message.content
-        if content and "[FINAL_ITINERARY_JSON]" in content:
-            print("Router -> PDFCreationAgent")
-            return "PDFCreationAgent"
-        if last_message.tool_calls:
-            print(f"Router -> call_tools")
-            return "call_tools"
-
-    # [수정됨] 무조건 종료하여 사용자 입력을 기다립니다.
-    # SupervisorAgent가 브리핑을 마치면 여기서 멈춥니다.
-    print("Router -> END")
-    return END
+    return {
+        "messages": results, 
+        "itinerary": new_itinerary,
+        "current_anchor": new_anchor,
+        "current_weather": weather_update,
+        "show_pdf_button": show_pdf,
+    }
 
 def build_graph():
     workflow = StateGraph(AgentState)
     workflow.add_node("SupervisorAgent", SupervisorAgent)
-    workflow.add_node("InfoCollectorAgent", InfoCollectorAgent)
-    workflow.add_node("WeatherAgent", WeatherAgent)
-    workflow.add_node("AttractionAgent", AttractionAgent)
-    workflow.add_node("RestaurantAgent", RestaurantAgent)
-    workflow.add_node("DayTransitionAgent", DayTransitionAgent)
-    workflow.add_node("ConfirmationAgent", ConfirmationAgent)
-    workflow.add_node("PDFCreationAgent", PDFCreationAgent)
-    workflow.add_node("call_tools", call_tools)
-
-    entry_points = {
-        "InfoCollectorAgent": "InfoCollectorAgent",
-        "WeatherAgent": "WeatherAgent",
-        "AttractionAgent": "AttractionAgent",
-        "RestaurantAgent": "RestaurantAgent",
-        "SupervisorAgent": "SupervisorAgent",
-        "DayTransitionAgent": "DayTransitionAgent",
-        "ConfirmationAgent": "ConfirmationAgent",
-        "PDFCreationAgent": "PDFCreationAgent",
-        "end_node": END
-    }
-    workflow.set_conditional_entry_point(supervisor_router, entry_points)
-    
-    common_edge_mapping = {
-        "call_tools": "call_tools", 
-        END: END, 
-        "PDFCreationAgent": "PDFCreationAgent"
-        # "retry" 제거됨
-    }
-
-    for agent in ["InfoCollectorAgent", "WeatherAgent", "AttractionAgent", "RestaurantAgent", "SupervisorAgent"]:
-        workflow.add_conditional_edges(agent, expert_router, common_edge_mapping)
-
-    workflow.add_edge("DayTransitionAgent", END)
-    workflow.add_edge("ConfirmationAgent", END)
-    workflow.add_edge("PDFCreationAgent", END)
-    workflow.add_conditional_edges("call_tools", supervisor_router, entry_points)
-
-    return workflow.compile(checkpointer=CHECKPOINTER)
+    workflow.add_node("call_tools", call_tools_node)
+    workflow.set_entry_point("SupervisorAgent")
+    workflow.add_conditional_edges(
+        "SupervisorAgent",
+        supervisor_loop_router,
+        {"call_tools": "call_tools", END: END, "SupervisorAgent": "SupervisorAgent"}
+    )
+    workflow.add_edge("call_tools", "SupervisorAgent")
+    return workflow.compile()

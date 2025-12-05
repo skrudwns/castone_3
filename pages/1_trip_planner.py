@@ -8,15 +8,15 @@ import json
 from datetime import datetime
 from fpdf import FPDF
 import time
+import os
 
-# --- 1. 헬퍼 함수: 무조건 안전한 문자열로 변환 ---
+# --- 1. 헬퍼 함수 ---
 def normalize_to_string(content):
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # 멀티모달 리스트 처리 [{'text': '...'}]
         texts = []
         for item in content:
             if isinstance(item, dict):
@@ -27,24 +27,15 @@ def normalize_to_string(content):
     return str(content)
 
 # --- 2. PDF 생성 함수 ---
-# pages/1_trip_planner.py
-
-from fpdf import FPDF
 from fpdf.enums import XPos, YPos
-import os
 
 def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, total_days):
-    """
-    여행 계획 PDF 생성 함수 (SmartScheduler 이동 경로 반영 & 최신 FPDF2 문법 적용)
-    """
     pdf = FPDF()
     pdf.add_page()
     
-    # 1. 폰트 로드 (NanumGothic)
     font_path = 'NanumGothic.ttf'
     bold_font_path = 'NanumGothicBold.ttf'
     
-    # 폰트 파일 존재 여부 확인 및 등록
     has_korean_font = False
     try:
         if os.path.exists(font_path):
@@ -52,7 +43,7 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
             if os.path.exists(bold_font_path):
                 pdf.add_font('NanumGothic', 'B', bold_font_path)
             else:
-                pdf.add_font('NanumGothic', 'B', font_path) # 볼드 없으면 일반으로 대체
+                pdf.add_font('NanumGothic', 'B', font_path)
             
             pdf.set_font('NanumGothic', '', 12)
             has_korean_font = True
@@ -61,42 +52,34 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
             pdf.set_font('Arial', '', 12)
     except Exception as e:
         print(f"⚠️ [PDF 생성] 폰트 로드 에러: {e}")
-        return None
+        pdf.set_font('Arial', '', 12)
 
-    # 2. 헤더 (여행지 및 기간)
     pdf.set_font_size(24)
-    # ln=True -> new_x=XPos.LMARGIN, new_y=YPos.NEXT 로 변경
     pdf.cell(0, 20, text=f"{destination} 여행 계획", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     pdf.set_font_size(12)
     pdf.cell(0, 10, text=f"기간: {dates}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
-    # 날씨 정보 (여러 줄일 수 있으므로 multi_cell 사용)
     if weather and weather.strip() and weather != '정보 없음':
         pdf.set_font_size(10)
         pdf.multi_cell(0, 5, text=f"날씨: {weather}", align='C')
 
     pdf.ln(10)
 
-    # 안전한 정렬 (day 키 기준)
     try:
-        sorted_itinerary = sorted(itinerary, key=lambda x: int(x.get('day', 1)))
+        sorted_itinerary = sorted(itinerary, key=lambda x: (int(x.get('day', 1)), x.get('start', '00:00')))
     except:
         sorted_itinerary = itinerary
 
-    # 3. 일차별 상세 일정 작성
     for day_num in range(1, total_days + 1):
-        # 날짜 헤더
         pdf.set_font_size(18)
         if has_korean_font: pdf.set_font('NanumGothic', 'B', 18)
         
         pdf.cell(0, 15, text=f"Day {day_num}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         
-        # 폰트 원복
         pdf.set_font_size(11)
         if has_korean_font: pdf.set_font('NanumGothic', '', 11)
 
-        # 해당 날짜 아이템 필터링
         items_today = [item for item in sorted_itinerary if int(item.get('day', 1)) == day_num]
         
         if not items_today:
@@ -107,174 +90,110 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
         for item in items_today:
             item_type = item.get('type', 'activity')
 
-            # --- [Case A] 이동 정보 (SmartScheduler가 생성한 'move') ---
             if item_type == 'move':
-                # 이동은 회색으로 작게 표시하여 시각적 구분
-                pdf.set_text_color(100, 100, 100) # Gray
+                pdf.set_text_color(100, 100, 100)
                 pdf.set_font_size(10)
-
-                start_t = item.get('start', '')
-                end_t = item.get('end', '')
-                duration = item.get('duration_text', '')
-                transport = item.get('transport', '이동')
-
-                # 🚨 [수정] 이모지 대신 화살표 문자 사용 (폰트 호환성)
-                move_text = f"      |  {start_t} ~ {end_t} ({duration}) : {transport}"
+                move_text = f"      |  {item.get('start', '')} ~ {item.get('end', '')} ({item.get('duration_text', '')}) : {item.get('transport', '이동')}"
                 pdf.cell(0, 8, text=move_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-                # 색상 및 크기 원복
-                pdf.set_text_color(0, 0, 0) # Black
+                pdf.set_text_color(0, 0, 0)
                 pdf.set_font_size(11)
-
-            # --- [Case B] 장소 방문 (activity/식당/관광지 등) ---
             else:
-                # 시간 정보
-                start_t = item.get('start', '')
-                end_t = item.get('end', '')
-                time_info = f"[{start_t}-{end_t}]" if start_t else "[시간 미정]"
+                time_info = f"[{item.get('start', '시간 미정')}-{item.get('end', '')}]" if item.get('start') else "[시간 미정]"
                 
-                place_name = item.get('name', '이름 없음')
-                category = item.get('category', item.get('type', '장소'))
-                
-                # 제목 라인 (볼드)
                 if has_korean_font: pdf.set_font('NanumGothic', 'B', 12)
-                
-                main_text = f"  ● {time_info} {place_name} ({category})"
+                main_text = f"  ● {time_info} {item.get('name', '이름 없음')} ({item.get('category', item_type)})"
                 pdf.cell(0, 8, text=main_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
                 
-                # 설명 라인 (일반)
                 if item.get('description'):
                     if has_korean_font: pdf.set_font('NanumGothic', '', 10)
-                    
-                    # 들여쓰기 후 설명 출력
-                    pdf.set_x(20) 
+                    pdf.set_x(20)
                     pdf.multi_cell(0, 5, text=f"{item['description']}")
                     pdf.ln(2)
-
-        pdf.ln(10) # 날짜 간 간격
+        pdf.ln(10)
 
     return bytes(pdf.output())
 
-
-# --- 3. 페이지 설정 ---
+# --- 3. 페이지 설정 및 세션 초기화 ---
 st.set_page_config(page_title="AI 여행 플래너", layout="centered")
 st.title("💬 AI 여행 플래너")
 
-# --- 3-1. 사이드바 질문 가이드 추가 ---
 with st.sidebar:
     st.header("질문 가이드")
     st.markdown("""
-    ### 장소 추천 요청
-    - "[관광지] 근처 관광지 추천해줘"
-    - "[관광지 또는 지역명]에서 맛있는 식당 알려줘"
-    - "[관광지 또는 지역명] 근처 카페 추천해줘"
-
-    ### 일정 수정
-    - "[]일차 일정 변경하고 싶어"
-    - "이 일정에서 이 장소 빼고 다른 곳 추천해줘"
-    - "점심 식사할 식당 변경해줘"
-
-    ### 경로 최적화
+    - "근처 관광지 추천해줘"
+    - "맛집 알려줘"
+    - "일정 수정하고 싶어"
     - "경로 최적화해줘"
-    - "[]에서 []까지 이동 시간 확인해줘"
-
-    ### PDF 다운로드
-    - "현재까지 일정 PDF로 작성해줘"
-
-    ---
-
-    **자유롭게 대화하듯 질문하세요**
+    - "PDF로 만들어줘"
     """)
 
 if "preferences_collected" not in st.session_state:
     st.warning("⚠️ 정보 입력 페이지에서 먼저 여행 정보를 입력해주세요.")
-    if st.button("돌아가기"):
-        st.switch_page("pages/1_📝_여행_정보_입력.py")
+    if st.button("정보 입력 페이지로 돌아가기"):
+        st.switch_page("app.py") # 또는 정보 입력 페이지의 실제 경로
     st.stop()
 
-# 세션 초기화
+# 세션 상태 초기화
 if "messages" not in st.session_state: st.session_state.messages = []
 if "itinerary" not in st.session_state: st.session_state.itinerary = []
-if "current_planning_day" not in st.session_state: st.session_state.current_planning_day = 1
-if "total_days" not in st.session_state: st.session_state.total_days = 1
 if "show_pdf_button" not in st.session_state: st.session_state.show_pdf_button = False
-if "destination" not in st.session_state: st.session_state.destination = ""
 if "current_weather" not in st.session_state: st.session_state.current_weather = ""
 
-@st.cache_resource
+# --- 4. 그래프 로드 ---
+# 🚨 [수정] st.cache_resource 제거
 def get_graph_app():
     return build_graph()
 
+# 각 세션에서 새 그래프를 빌드
 APP = get_graph_app()
-
-# --- 4. 상태 업데이트 로직 (안전장치 적용) ---
-def update_state_from_message(message_content):
-    # 🚨 [핵심] 입력값을 무조건 문자열로 변환
-    message_text = normalize_to_string(message_content)
-
-    match_plan = re.search(r"'(.*?)'을/를 (\d+)일차 (관광지|식당|카페) 계획에 추가합니다", message_text)
-    if match_plan:
-        place_name, day, place_type = match_plan.groups()
-        new_item = {'day': int(day), 'type': place_type, 'name': place_name}
-        if new_item not in st.session_state.itinerary:
-            st.session_state.itinerary.append(new_item)
-
-    if "[STATE_UPDATE: increment_day=True]" in message_text:
-        st.session_state.current_planning_day += 1
-
-    if "[STATE_UPDATE: show_pdf_button=True]" in message_text:
-        st.session_state.show_pdf_button = True
 
 # --- 5. AI 에이전트 실행 ---
 def run_ai_agent():
-    config = {"configurable": {"thread_id": "streamlit_user"}}
+    # 🚨 [중요] 스레드 ID를 세션마다 고유하게 설정
+    thread_id = st.session_state.session_id if 'session_id' in st.session_state else "streamlit_user"
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
     
-    inputs = {
+    # 그래프에 전달할 현재 상태
+    current_state = {
         "messages": st.session_state.messages,
         "itinerary": st.session_state.itinerary,
-        "destination": st.session_state.destination,
-        "dates": st.session_state.dates,
-        "preference": st.session_state.preference,
-        "total_days": st.session_state.total_days,
-        "activity_level": st.session_state.activity_level,
-        "current_planning_day": st.session_state.current_planning_day,
-        "current_weather": st.session_state.current_weather,
-        "show_pdf_button": st.session_state.show_pdf_button,
+        "destination": st.session_state.get('destination', ''),
+        "dates": st.session_state.get('dates', ''),
+        "preference": st.session_state.get('preference', ''),
+        "total_days": st.session_state.get('total_days', 1),
+        "activity_level": st.session_state.get('activity_level', 3),
+        "current_weather": st.session_state.get('current_weather', ''),
+        "show_pdf_button": st.session_state.get('show_pdf_button', False),
+        "current_anchor": st.session_state.get('current_anchor', st.session_state.get('destination', ''))
     }
     
     with st.spinner("AI가 생각 중입니다..."):
-        response = APP.invoke(inputs, config=config)
-    
-    st.session_state.messages = response.get('messages', st.session_state.messages)
-    st.session_state.itinerary = response.get('itinerary', st.session_state.itinerary)
-    
-    if response.get('current_weather'):
-        st.session_state.current_weather = response['current_weather']
-    
-    if response.get('show_pdf_button'):
-        st.session_state.show_pdf_button = True
+        # invoke의 결과를 response 변수에 저장
+        response = APP.invoke(current_state, config=config)
 
-    # 마지막 메시지 처리
-    if st.session_state.messages:
-        final_msg = st.session_state.messages[-1]
-        if isinstance(final_msg, AIMessage):
-            update_state_from_message(final_msg.content)
-
-            if "[STATE_UPDATE: show_pdf_button=True]" in normalize_to_string(final_msg.content):
-                st.rerun()
+    # 🚨 [수정] 그래프의 최종 상태를 세션 상태에 통째로 업데이트
+    st.session_state.messages = response.get('messages', [])
+    st.session_state.itinerary = response.get('itinerary', [])
+    st.session_state.current_weather = response.get('current_weather', '')
+    st.session_state.show_pdf_button = response.get('show_pdf_button', False)
+    st.session_state.current_anchor = response.get('current_anchor', '')
 
 # --- 6. 초기 실행 ---
 if not st.session_state.messages:
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = str(time.time()) # 고유 세션 ID 생성
+
     initial_prompt = f"""
     안녕하세요! 방금 입력한 정보를 바탕으로 여행 계획을 시작해주세요.
-    - 목적지: {st.session_state.destination}
-    - 여행 기간: {st.session_state.dates}
-    - 나의 여행 스타일: {st.session_state.preference}
+    - 목적지: {st.session_state.get('destination')}
+    - 여행 기간: {st.session_state.get('dates')} (총 {st.session_state.get('total_days')}일)
+    - 하루 목표 활동량: {st.session_state.get('activity_level')}곳
+    - 나의 여행 스타일: {st.session_state.get('preference')}
     
-    이제 위 정보를 바탕으로 1일차 계획 추천을 시작해주세요.
+    이제 위 정보를 바탕으로 전체 여행 계획을 추천해주세요.
     """
     st.session_state.messages.append(HumanMessage(content=initial_prompt))
-    run_ai_agent() # 첫 실행
+    run_ai_agent()
     st.rerun()
 
 # --- 7. 화면 출력 ---
@@ -282,33 +201,23 @@ for msg in st.session_state.messages:
     if isinstance(msg, HumanMessage):
         st.chat_message("user").markdown(msg.content)
     elif isinstance(msg, AIMessage):
-        # 안전한 변환
         safe_content = normalize_to_string(msg.content)
         
-        # 태그 제거
-        cleaned_text = re.sub(r"\[FINAL_ITINERARY_JSON\].*?\[/FINAL_ITINERARY_JSON\]", "", safe_content, flags=re.DOTALL)
-        cleaned_text = re.sub(r"\[(STATE_UPDATE|PLAN_ADD):.*?\]", "", cleaned_text, flags=re.DOTALL)
+        # [ADD_PLACE] 등 내부 태그 제거 후 출력
+        cleaned_text = re.sub(r"\[(ADD|REPLACE|DELETE)_PLACE\].*?\[/\1_PLACE\]", "", safe_content, flags=re.DOTALL)
+        cleaned_text = re.sub(r"\[STATE_UPDATE:.*?\]", "", cleaned_text)
         
         if cleaned_text.strip():
             st.chat_message("assistant").markdown(cleaned_text.strip())
 
 # --- 8. PDF 다운로드 ---
 if st.session_state.show_pdf_button:
-    # 경로 정보 안전하게 추출
-    final_routes_text = "경로 정보 없음"
-    for msg in reversed(st.session_state.messages):
-        if isinstance(msg, AIMessage):
-            c_str = normalize_to_string(msg.content)
-            if "최적 경로" in c_str:
-                final_routes_text = re.sub(r"\[.*?\]", "", c_str).strip()
-                break
-                
     pdf_bytes = create_itinerary_pdf(
         st.session_state.itinerary,
         st.session_state.destination,
         st.session_state.dates,
         st.session_state.current_weather,
-        final_routes_text,
+        "", # final_routes는 더 이상 직접 파싱하지 않음
         st.session_state.total_days
     )
     if pdf_bytes:
