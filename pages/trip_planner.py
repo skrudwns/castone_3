@@ -8,7 +8,12 @@ from fpdf import FPDF
 import time
 import os
 from fpdf.enums import XPos, YPos
+from src.config import load_faiss_index
 
+
+with st.spinner("여행 데이터를 불러오는 중입니다..."):
+    DB = load_faiss_index()
+    print("DEBUG: 1_trip_planner 페이지에서 DB 로드 확인 완료")
 # --- 1. 헬퍼 함수 ---
 def normalize_to_string(content):
     if content is None:
@@ -143,7 +148,6 @@ if "preferences_collected" not in st.session_state:
         st.session_state.destination = "부산 해운대"
         st.session_state.dates = "2025-12-06 (1일)"
         st.session_state.total_days = 1
-        st.session_state.activity_level = 3
         st.session_state.preference = "맛집 탐방"
         st.session_state.group_type = "친구"
         st.session_state.preferences_collected = True
@@ -185,7 +189,6 @@ async def run_ai_agent():
         "style": st.session_state.get('preference', ''),
         "preference": st.session_state.get('preference', ''),
         "total_days": st.session_state.get('total_days', 1),
-        "activity_level": st.session_state.get('activity_level', 3),
         "current_weather": st.session_state.get('current_weather', ''),
         "show_pdf_button": st.session_state.get('show_pdf_button', False),
         "current_anchor": st.session_state.get('current_anchor', st.session_state.get('destination', '')),
@@ -213,7 +216,6 @@ if not st.session_state.messages:
     안녕하세요! 아래 정보로 여행 계획을 세워주세요.
     - 목적지: {st.session_state.get('destination')}
     - 일정: {st.session_state.get('dates')} (총 {st.session_state.get('total_days')}일)
-    - 활동량: 하루 {st.session_state.get('activity_level')}곳
     - 스타일: {st.session_state.get('preference')}
     - 동행: {st.session_state.get('group_type')}
     
@@ -232,7 +234,7 @@ for msg in st.session_state.messages:
     elif isinstance(msg, AIMessage) and msg.content:
         content_str = normalize_to_string(msg.content)
         if content_str.strip():
-            clean_content = re.sub(r"\[(ADD|REPLACE|DELETE)_PLACE\].*?\[/\1_PLACE\]", "", msg.content, flags=re.DOTALL)
+            clean_content = re.sub(r"\[(ADD|REPLACE|DELETE)_PLACE\].*?\[/\1_PLACE\]", "", content_str, flags=re.DOTALL)
             if "FINISH" in clean_content and len(clean_content) < 10:
                 continue
             if clean_content.strip():
@@ -240,11 +242,12 @@ for msg in st.session_state.messages:
 
 # --- 8. PDF 다운로드 버튼 ---
 if st.session_state.show_pdf_button:
+    weather_info = st.session_state.get('current_weather', '날씨 정보 없음')
     pdf_bytes = create_itinerary_pdf(
         st.session_state.itinerary,
         st.session_state.destination,
         st.session_state.dates,
-        st.session_state.current_weather,
+        weather_info,
         "", 
         st.session_state.total_days
     )

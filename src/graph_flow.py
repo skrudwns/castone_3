@@ -15,7 +15,6 @@ class AgentState(TypedDict):
     dates: str
     group_type: str
     total_days: int
-    activity_level: int
     style: str
     preference: str
     
@@ -26,24 +25,72 @@ class AgentState(TypedDict):
     
     dialog_stage: str # 'planning' | 'editing'
 
-# --- 2. 프롬프트 ---
-planner_prompt = """당신은 '여행 계획 기획자(Planner)'입니다.
-전체 여행 기간({total_days}일)의 일정을 채우세요.
+planner_prompt = """당신은 '엄격한 여행 스케줄러'입니다.
+주어진 여행 기간({total_days}일) 동안 아래 [고정 스케줄]을 기계적으로 따르세요.
 
-[수칙]
-1. `find_and_select_best_place`로 장소를 채우세요.
-2. 한 날짜가 차면 `plan_itinerary_timeline`으로 시간을 계산하세요.
-3. **[LOOP 방지]** 만약 직전 메시지가 **'TIMELINE_CALCULATED'**라면, 당신의 다음 행동은 **반드시** `find_and_select_best_place`를 호출하여 새로운 장소를 찾는 것이어야 합니다. 타임라인 도구를 연속으로 호출하지 마세요!
-4. 모든 날짜가 채워지기 전까지는 멈추지 마세요.
+🚨 **[최우선 종료 규칙]**
+- **마지막 날(Day {total_days})**에는 **'관광지' 딱 1곳**만 찾으면 끝입니다.
+- 식당, 카페, 저녁 일정을 절대 추가하지 마세요.
+- **마지막 날 관광지 1곳이 확보되면**, 즉시 `plan_itinerary_timeline`을 호출하여 종료하세요.
+
+✅ **[최종 결과물 필수 요구사항]**
+일정을 확정할 때(`plan_itinerary_timeline` 결과) 다음 3가지 요소에 집중하세요:
+1. **각 일정의 대략적인 시간** (예: 10:00 ~ 11:30)
+2. **장소 간 이동 시간** (예: 약 30분 소요)
+3. **상세 교통편 정보** (예: 1003번 버스 ➡️ 도보)
+*장소에 대한 긴 설명이나 미사여구는 줄이고, 위 '시간'과 '이동' 정보 위주로 구성하세요.*
+
+**[시간 관리 규칙]**
+- Day 2 ~ Day {total_days} 일정은 무조건 **'오전 10시 시작'**으로 설정하세요.
+- 모든 일정은 시간 순서대로 정렬되어야 합니다.
+
+[일차별 시퀀스 정의]
+🔴 **Day 1 (첫날)**
+   1. 점심 (식당)
+   2. 카페
+   3. 관광지
+   4. 저녁 (식당)
+   👉 (총 4곳)
+
+🟠 **Day 2 ~ Day {total_days}-1 (중간 날)**
+   1. 관광지 (오전 10시 시작)
+   2. 점심 (식당)
+   3. 카페
+   4. 관광지
+   5. 저녁 (식당)
+   👉 (총 5곳)
+
+🟢 **Day {total_days} (마지막 날)**
+   1. 관광지 (오전 10시 시작)
+   👉 (총 1곳 -> 종료!)
+
+[행동 지침]
+- 현재 `itinerary`를 확인하고 위 순서에서 **빠진 다음 장소** 하나만 `find_and_select_best_place`로 찾으세요.
 """
 
-editor_prompt = """당신은 '여행 계획 편집자(Editor)'입니다.
-사용자의 요청에 따라 일정을 수정합니다.
+editor_prompt = """당신은 '여행 일정 편집자'입니다.
+사용자의 수정 요청을 처리하고, 최종 결과를 **가독성 좋게** 보여주세요.
 
-[수칙]
-1. 사용자가 "OO를 XX로 바꿔줘"라고 하면 `find_and_select_best_place` 등을 사용해 해당 장소를 추가/교체하세요.
-2. 장소 변경이 완료되면, **즉시 `plan_itinerary_timeline`을 호출하여 전체 일정을 갱신**하세요.
-3. 다른 말은 하지 말고 도구 호출에만 집중하세요.
+[수정 원칙]
+1. **장소 교체:** 사용자가 "A를 B로 바꿔줘"라고 하면:
+   - 먼저 `delete_place(place_name="A")`를 호출하여 A를 지우세요.
+   - 그 다음 `find_and_select_best_place(query="B")`를 호출하여 B를 추가하세요.
+   - 마지막으로 `plan_itinerary_timeline`으로 전체 시간을 재계산하세요.
+2. **단순 삭제:** `delete_place` 후 `plan_itinerary_timeline` 호출.
+
+[최종 응답 형식 (Markdown)]
+일정이 확정되면 아래 포맷으로 깔끔하게 브리핑하세요.
+
+## 📅 [여행지] 여행 계획표
+**Day N**
+- 🕙 **10:00 장소명** (카테고리)
+  - 💡 *추천 이유 한 줄 요약*
+  - 🚌 *다음 장소로 이동: 1003번 버스 (약 30분)*
+
+... (반복)
+
+[다운로드 안내]
+"이대로 확정하시겠습니까? 아래 버튼을 눌러 PDF를 받아보세요."
 """
 
 # --- 3. 에이전트 생성 ---
@@ -143,95 +190,51 @@ async def call_tools_node(state: AgentState):
                     try:
                         item_json = json.loads(output)
                         if not any(x.get('name') == item_json.get('name') for x in new_itinerary):
-                            # 날짜 할당 로직: 가장 마지막 날짜 혹은 다음 날짜로 할당
-                            current_places = [item for item in new_itinerary if item.get('type') != 'move']
-                            last_day = max(item.get('day', 1) for item in current_places) if current_places else 1
-                            count_on_last_day = sum(1 for x in current_places if x.get('day') == last_day)
-                            
-                            # 활동량(activity_level)을 초과하면 다음 날짜로 할당
-                            if count_on_last_day >= state.get('activity_level', 3) and last_day < total_days:
-                                item_json['day'] = last_day + 1
+                            # [단순화] 날짜 할당 로직: 현재 마지막 날짜 혹은 1일차에 이어서 붙임
+                            # 고정 스케줄러이므로 순서대로만 쌓으면 됨
+                            current_places = [i for i in new_itinerary if i.get('type') != 'move']
+                            if not current_places:
+                                item_json['day'] = 1
                             else:
-                                item_json['day'] = last_day
+                                last_item = current_places[-1]
+                                # Day 1은 4개까지, Day 2~N은 5개까지 등 개수 세서 day 올리는 로직 필요
+                                # (복잡하면 일단 마지막 아이템과 같은 날짜로 넣고 SmartScheduler가 정렬하게 둠)
+                                item_json['day'] = last_item.get('day', 1)
                                 
                             new_itinerary.append(item_json)
                             new_anchor = item_json.get('name')
-                            print(f"DEBUG: 장소 추가됨: {new_anchor} (Day {item_json['day']})")
                     except: pass
 
+                # 2. [신규] 장소 삭제/교체 처리
+                elif tool_name == "delete_place" or tool_name == "replace_place":
+                    try:
+                        action_data = json.loads(output)
+                        target_name = action_data.get('place_name') or action_data.get('old')
+                        if target_name:
+                            # 이름이 포함된 장소를 찾아서 제거
+                            initial_len = len(new_itinerary)
+                            new_itinerary = [
+                                item for item in new_itinerary 
+                                if target_name not in item.get('name', '')
+                            ]
+                            if len(new_itinerary) < initial_len:
+                                print(f"DEBUG: '{target_name}' 삭제 완료.")
+                            
+                    except Exception as e:
+                        print(f"DEBUG: 삭제 처리 중 오류: {e}")
 
-                # 2. 타임라인 생성 (plan_itinerary_timeline)
+                # 3. 타임라인 재계산 (기존 로직 유지)
                 elif tool_name == "plan_itinerary_timeline":
                     try:
-                        new_itinerary = json.loads(output) # 상세 정보(이동시간 등) 업데이트
-                        
-                        # [복원] 전체 N일차 계획이 모두 완성되었는지 확인
-                        is_plan_complete = True
-                        day_counts = {}
-                        for item in new_itinerary:
-                            if item.get('type') != 'move':
-                                day = item.get('day')
-                                if day:
-                                    day_counts[day] = day_counts.get(day, 0) + 1
-                        
-                        for day_num in range(1, total_days + 1):
-                            if day_counts.get(day_num, 0) < state.get('activity_level', 3):
-                                is_plan_complete = False
-                                break
-                        
-                        # [복원] 계획이 아직 미완성인 경우, Planner로 복귀
-                        if not is_plan_complete:
-                            print(f"DEBUG: 📅 Plan not yet complete. Returning to Planner agent.")
-                            # [수정] Planner의 루프 방지 프롬프트를 위한 신호 메시지 추가
-                            tool_outputs.append(HumanMessage(content="TIMELINE_CALCULATED"))
-                        
-                        # [복원] 계획이 완성된 경우, 요약본 생성 및 Editor 모드 전환
-                        else:
-                            print(f"DEBUG: 🎉 Plan complete! Switching to editing mode and showing summary.")
-                            current_stage = "editing" # Switch stage
-                            
-                            # 사용자에게 보여줄 최종 요약본 생성
-                            summary = "🚗 **여행 계획 초안이 완성되었습니다.**\n내용을 확인하시고, 수정이 필요하면 알려주세요.\n\n"
-                            
-                            current_day = 0
-                            sorted_itinerary = sorted(new_itinerary, key=lambda x: (int(x.get('day', 1)), x.get('start', '00:00')))
-
-                            for item in sorted_itinerary:
-                                item_day = item.get('day', 0)
-                                if item_day != current_day:
-                                    summary += f"\n**🗓️ Day {item_day}**\n"
-                                    current_day = item_day
-                                
-                                item_type = item.get('type', 'activity')
-                                
-                                if item_type == 'move':
-                                    dur_text = item.get('duration_text', '이동')
-                                    summary += f"   ⬇️ *{dur_text}*\n"
-                                else:
-                                    time_str = f"[{item.get('start')}] " if item.get('start') else ""
-                                    name = item.get('name', '이름 없음')
-                                    desc = item.get('description', '')
-                                    summary += f"   📍 **{time_str}{name}**\n"
-                                    if desc:
-                                        summary += f"      └ 💡 {desc}\n"
-
-                            summary += "\n\n**이대로 확정하고 PDF를 다운로드할까요? 아니면 수정할까요?**"
-                            
-                            # 요약 AIMessage를 추가하여 그래프가 종료되도록 함
-                            tool_outputs.append(AIMessage(content=summary))
-                            
-                    except Exception as e: 
-                        print(f"DEBUG: Timeline JSON 파싱 실패: {e}")
-                        pass
-
-                # 3. PDF 확정
+                        new_itinerary = json.loads(output)
+                        # 여기서 요약본을 생성하지 않고, EditorAgent가 직접 예쁘게 말하도록 유도
+                        # tool_outputs에 데이터만 담아두면 됨
+                    except: pass
+                
+                # 4. PDF 확정
                 elif tool_name == "confirm_and_download_pdf":
                     show_pdf = True
-                    tool_outputs.append(AIMessage(content="✅ **확정되었습니다!** 아래 버튼을 눌러주세요."))
 
-    # ---------------------------------------------------------
-    # 4. 최종 리턴
-    # ---------------------------------------------------------
     return {
         "messages": tool_outputs, 
         "itinerary": new_itinerary,

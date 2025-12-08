@@ -5,7 +5,7 @@ import httpx
 import asyncio
 import datetime
 import re 
-from typing import List, Any, Dict, Optional
+from typing import List, Any, Dict, Optional, Tuple
 import traceback
 from itertools import permutations
 
@@ -14,7 +14,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.load import dumps, loads
-from src.config import LLM, DB_INSTANCE, GMAPS_CLIENT 
+from src.config import LLM, load_faiss_index, GMAPS_CLIENT
 
 # 🚨 [중요] 사용자가 제공한 지역명 정규화 모듈 임포트
 try:
@@ -22,19 +22,24 @@ try:
 except ImportError:
     def normalize_region_name(name): return name
 
-# --- [신규] 1. 지역명 추출 및 개인화 설명 체인 ---
+# --- [1] LLM 체인 정의 (지역 추출, 설명 생성) ---
 
 # 1-1. 검색어에서 행정구역 추출 (LLM fallback용)
 region_prompt = PromptTemplate.from_template("""
-사용자의 검색어: "{query}"
-현재 여행 목적지: "{destination}"
+역할: 당신은 '지명 정규화 전문가'입니다.
+목표: 사용자의 검색어("{query}")와 여행 목적지("{destination}")를 보고, 검색 대상이 되는 **정확한 행정구역 명칭** 하나만 출력하세요.
 
-이 검색어가 가리키는 정확한 행정구역(City, District)을 추출해.
-- 예: "해운대 맛집" -> "부산광역시 해운대구"
-- 예: "문경새재" -> "경상북도 문경시"
-- 예: "근처 카페" -> "{destination}" (목적지 따라감)
+[규칙]
+1. 검색어에 '해운대', '송도' 같은 구체적 지명이 있다면, 해당 지명의 **공식 행정구역명**을 찾으세요.
+2. 검색어가 '맛집', '카페' 등 일반 명사뿐이라면, **여행 목적지("{destination}")**를 정규화해서 반환하세요.
+3. **절대 추측하지 마세요.** 모르면 "{destination}"을 그대로 반환하세요.
+4. 답변에는 군더더기 없이 **오직 지역명만** 출력하세요.
 
-답변은 군더더기 없이 **오직 지역명만** 출력해.
+[예시]
+- 입력: "해운대 맛집", 목적지: "부산" -> 출력: "부산광역시 해운대구"
+- 입력: "성산일출봉", 목적지: "제주도" -> 출력: "제주특별자치도 서귀포시"
+- 입력: "강남 점심", 목적지: "서울" -> 출력: "서울특별시 강남구"
+- 입력: "맛집 추천", 목적지: "여수" -> 출력: "전라남도 여수시"
 """)
 region_chain = region_prompt | LLM | StrOutputParser()
 
@@ -52,18 +57,14 @@ desc_prompt = PromptTemplate.from_template("""
 desc_chain = desc_prompt | LLM | StrOutputParser()
 
 
-# --- 2. 지리 정보 헬퍼 함수 ---
+# --- [2] 지리/거리 계산 헬퍼 함수 ---
 
 async def get_coordinates(location_name: str):
-    """지명 -> 좌표 변환"""
+    """지명/주소 -> 좌표 변환 (Google Maps API)"""
     if not GMAPS_CLIENT: return None, None
     try:
+        # API 비용 절약을 위해 너무 긴 주소는 적당히 자르거나 처리할 수 있음
         res = await asyncio.to_thread(GMAPS_CLIENT.geocode, location_name, language='ko')
-        if not res:
-            normalized = normalize_region_name(location_name)
-            if normalized != location_name:
-                res = await asyncio.to_thread(GMAPS_CLIENT.geocode, normalized, language='ko')
-        
         if res:
             loc = res[0]['geometry']['location']
             return loc['lat'], loc['lng']
@@ -71,14 +72,23 @@ async def get_coordinates(location_name: str):
         print(f"DEBUG: 좌표 변환 실패 ({location_name}): {e}")
     return None, None
 
+def calculate_haversine_distance(lat1, lon1, lat2, lon2):
+    """두 좌표 간의 직선 거리(km) 계산 (Pure Python)"""
+    try:
+        lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
+    except (ValueError, TypeError):
+        return 9999.0
+
+    R = 6371  # 지구 반지름 (km)
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
 def calculate_distance_time(start_lat, start_lng, end_lat, end_lng, mode="driving"):
-    """직선 거리 기반 시간 추정"""
-    R = 6371
-    d_lat = math.radians(end_lat - start_lat)
-    d_lng = math.radians(end_lng - start_lng)
-    a = math.sin(d_lat/2)**2 + math.cos(math.radians(start_lat)) * math.cos(math.radians(end_lat)) * math.sin(d_lng/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    dist = R * c
+    """좌표 간 단순 직선 거리 및 예상 시간 추정"""
+    dist = calculate_haversine_distance(start_lat, start_lng, end_lat, end_lng)
     
     speed = 4.0 if mode == "walking" else 30.0
     seconds = int((dist / speed) * 3600)
@@ -118,10 +128,9 @@ async def get_detailed_route(start_place: str, end_place: str, mode="transit", d
                 "start_location": route['start_location'], "end_location": route['end_location']
             }
     except Exception as e:
-        # print(f"DEBUG: API 경로 조회 실패: {e}")
         pass
     
-    # Fallback
+    # Fallback: 직선 거리 계산
     slat, slng = await get_coordinates(start_place)
     elat, elng = await get_coordinates(end_place)
     if slat and elat:
@@ -129,17 +138,13 @@ async def get_detailed_route(start_place: str, end_place: str, mode="transit", d
         return {"mode": mode, "duration": txt, "duration_value": sec, "distance": f"{dist:.1f}km", "steps": ["직선거리"], "start_location": {"lat":slat, "lng":slng}, "end_location": {"lat":elat, "lng":elng}}
     return None
 
-# --- [핵심 복구] 행정구역 변환 함수 (ImportError 해결 대상) ---
 async def resolve_admin_region(query: str, destination: str) -> str:
     """
     [핵심 로직] "광안리" -> "부산광역시 수영구" 자동 변환기
-    Google Maps API를 사용하여 비공식 지명을 공식 행정구역으로 변환합니다.
     """
-    # 1. API 클라이언트 확인
     if not GMAPS_CLIENT: 
         return normalize_region_name(destination)
 
-    # 2. 검색어 보정
     search_term = query
     if destination and destination not in query:
         search_term = f"{destination} {query}"
@@ -147,7 +152,6 @@ async def resolve_admin_region(query: str, destination: str) -> str:
     print(f"DEBUG: 🗺️ 행정구역 식별 시도: '{search_term}'")
 
     try:
-        # 3. Geocoding
         geocode_res = await asyncio.to_thread(GMAPS_CLIENT.geocode, search_term, language='ko')
         
         if not geocode_res:
@@ -156,16 +160,14 @@ async def resolve_admin_region(query: str, destination: str) -> str:
         loc = geocode_res[0]['geometry']['location']
         lat, lng = loc['lat'], loc['lng']
         
-        # 4. Reverse Geocoding
         reverse_res = await asyncio.to_thread(GMAPS_CLIENT.reverse_geocode, (lat, lng), language='ko')
         
         if not reverse_res:
             return normalize_region_name(destination)
             
-        # 5. 행정구역 파싱
         comps = reverse_res[0].get('address_components', [])
-        level1 = "" # 광역
-        level2 = "" # 기초
+        level1 = "" 
+        level2 = "" 
         
         for c in comps:
             types = c.get('types', [])
@@ -189,87 +191,156 @@ async def resolve_admin_region(query: str, destination: str) -> str:
         return normalize_region_name(destination)
 
 
-# --- 3. 핵심 도구 (Tools) ---
+# --- [3] 핵심 검색 도구 (검색 + 필터링 + Fallback 로직) ---
 
-@tool
-async def find_and_select_best_place(query: str, destination: str, anchor: str = "", exclude_places: List[str] = [], user_info: str = "") -> str:
-    """
-    [핵심 도구] 장소를 검색하고 최적의 1곳을 반환합니다.
-    """
-    print(f"\n--- [DEBUG] find_and_select_best_place 호출 ---")
-    print(f"QUERY: {query} / ANCHOR: {anchor} / DEST: {destination}")
-    
-    # ---------------------------------------------------------
-    # [수정된 로직] 앵커 우선 변환 정책
-    # ---------------------------------------------------------
-    target_region = ""
-    
-    # 1. 앵커(구체적 장소/지역)가 있다면 -> 앵커를 행정구역으로 변환 (예: "광안리" -> "부산 수영구")
-    if anchor:
-        print(f"DEBUG: ⚓️ 앵커 기반 지역 변환 시도: '{anchor}'")
-        target_region = await resolve_admin_region(anchor, destination)
-    
-    # 2. 앵커가 없다면 -> 쿼리나 목적지를 기반으로 변환 (예: "부산 맛집" -> "부산광역시")
-    else:
-        print(f"DEBUG: 🔍 쿼리/목적지 기반 지역 변환 시도")
-        target_input = query if destination in query else f"{destination} {query}"
-        target_region = await resolve_admin_region(target_input, destination)
-
-    target_region = target_region.strip()
-    print(f"DEBUG: 🎯 확정 타겟 지역: '{target_region}'")
-
-    # ---------------------------------------------------------
-    # Vector DB 검색
-    # ---------------------------------------------------------
-    # 검색어 구성: "부산광역시 수영구" + "오션뷰 카페"
-    # 이렇게 해야 "수영구"에 있는 "오션뷰 카페"만 나옵니다.
-    search_query = f"{target_region} {query}"
-    
+async def _search_docs(query_str: str, k: int = 20):
+    """Vector DB 검색 래퍼"""
     try:
-        # k=20으로 넉넉하게 가져옴
-        docs = await DB_INSTANCE.asimilarity_search(search_query, k=20)
+        print(f"DEBUG: 🔍 벡터 DB 검색 시도: '{query_str}'")
+        db= load_faiss_index()
+        if db is None:
+            print("DEBUG: ❌ 벡터 DB 인스턴스 없음")
+            return []
+        return await asyncio.to_thread(db.similarity_search, query_str, k=k)
     except Exception as e:
-        print(f"DEBUG: Vector Store 검색 실패: {e}")
-        return "검색 시스템 오류가 발생했습니다."
+        print(f"DEBUG: DB 검색 실패: {e}")
+        return []
 
-    # ---------------------------------------------------------
-    # 필터링 및 후보 선정 (기존 로직 유지)
-    # ---------------------------------------------------------
+async def _filter_candidates(docs, target_region: str, exclude_places: List[str], category_filter: str):
+    """
+    메타데이터 필터링 (지역명 + 카테고리 + 제외 장소)
+    """
     candidates = []
-    target_parts = target_region.split()
     
-    refined_targets = []
-    for part in target_parts:
-        clean_part = re.sub(r'(특별시|광역시|특별자치시|특별자치도|도|시|군|구)$', '', part)
-        if len(clean_part) >= 2: refined_targets.append(clean_part)
-            
+    # 1. 지역명 필터 키워드 준비
+    target_parts = target_region.split()
+    refined_targets = [re.sub(r'(특별시|광역시|도|시|군|구)$', '', p) for p in target_parts]
     if not refined_targets: refined_targets = target_parts
 
-    print(f"DEBUG: ⚙️ 필터 키워드: {refined_targets}")
+    print(f"DEBUG: ⚙️ 필터 적용 - 지역키워드:{refined_targets} / 카테고리:{category_filter}")
 
     for doc in docs:
         name = doc.metadata.get('장소명', '이름미상')
-        address = doc.metadata.get('지역', '')
-        
+        address = doc.metadata.get('지역', '') or doc.metadata.get('road_address', '')
+        doc_cat = doc.metadata.get('카테고리', '')
+
+        # A. 제외 장소 필터
         if name in exclude_places: continue
-        
-        # 교차 검증
+
+        # B. 카테고리 필터 (엄격 + 유연)
+        if category_filter == "식당" or category_filter == "맛집":
+            if not any(x in doc_cat for x in ["식당", "맛집", "음식점"]): continue
+        elif category_filter == "카페":
+            if not any(x in doc_cat for x in ["카페", "커피"]): continue
+        elif category_filter == "관광지":
+            if not any(x in doc_cat for x in ["관광", "여행", "명소"]): continue
+
+        # C. 지역 텍스트 매칭 필터
         is_match = False
-        if all(k in address for k in refined_targets): is_match = True
-        elif refined_targets and refined_targets[-1] in address: is_match = True
+        if not refined_targets:
+            is_match = True
+        elif all(k in address for k in refined_targets): 
+            is_match = True
+        elif refined_targets and refined_targets[-1] in address: 
+            is_match = True
             
-        if is_match: candidates.append(doc)
+        if is_match:
+            candidates.append(doc)
+            
+    return candidates
 
-    # Fallback (필터 실패 시 완화)
-    if not candidates:
-        print("DEBUG: ⚠️ 엄격 매칭 실패. 검색 상위 결과 사용.")
-        candidates = docs[:3] 
-
-    # 최적 장소 선정
-    best_doc = candidates[0]
-    best_name = best_doc.metadata.get('장소명')
-    best_address = best_doc.metadata.get('지역')
+@tool
+async def find_and_select_best_place(query: str,
+                                    destination: str,
+                                    anchor: str = "",
+                                    exclude_places: List[str] = [],
+                                    user_info: str = "", 
+                                    category_filter: str = "") -> str:
+    """
+    [핵심 도구] 최적의 장소 1곳을 반환합니다.
+    1. 선호 반영 검색 -> 2. (실패시) 선호 제외 재검색 -> 3. (필요시) 거리순 정렬
+    """
+    print(f"\n--- [DEBUG] find_and_select_best_place 호출 ---")
     
+    # 1. 지역 및 기준점 설정
+    target_region = ""
+    if anchor:
+        target_region = await resolve_admin_region(anchor, destination)
+    else:
+        target_input = query if destination in query else f"{destination} {query}"
+        target_region = await resolve_admin_region(target_input, destination)
+    target_region = target_region.strip()
+
+    # 기준점(Anchor) 좌표 확보 (거리 계산용)
+    center_place = anchor if anchor else target_region
+    center_lat, center_lng = None, None
+    if center_place:
+        print(f"DEBUG: 📍 기준점 좌표 조회: '{center_place}'")
+        center_lat, center_lng = await get_coordinates(center_place)
+
+    # ------------------------------------------------------------------
+    # [1단계] 사용자 선호(user_info)를 포함한 정밀 검색
+    # ------------------------------------------------------------------
+    search_query_v1 = f"{target_region} {query} {user_info} {category_filter}"
+    print(f"DEBUG: 🔍 1차 검색 시도 (선호 포함): '{search_query_v1}'")
+    
+    docs_v1 = await _search_docs(search_query_v1, k=20)
+    candidates = await _filter_candidates(docs_v1, target_region, exclude_places, category_filter)
+    print(f"DEBUG: 🎯 1차 후보군 수: {len(candidates)}")
+
+    # ------------------------------------------------------------------
+    # [2단계] Fallback: 결과가 0개면 선호 빼고 재검색 (거리 우선 모드)
+    # ------------------------------------------------------------------
+    if not candidates:
+        print(f"DEBUG: ⚠️ 1차 검색 결과 없음 -> 2차 검색(선호 제외, 거리/카테고리 중심) 전환")
+        
+        # user_info 제거하고 기본 쿼리로만 검색
+        search_query_v2 = f"{target_region} {query} {category_filter}"
+        print(f"DEBUG: 🔍 2차 검색 시도: '{search_query_v2}'")
+        
+        docs_v2 = await _search_docs(search_query_v2, k=20)
+        candidates = await _filter_candidates(docs_v2, target_region, exclude_places, category_filter)
+        
+        # 2차 검색 결과가 있다면, 이 중 "가장 가까운 곳"을 찾기 위해 좌표 변환 수행
+        if candidates and center_lat and center_lng:
+            print("DEBUG: 📏 후보군 상위 5개 거리 계산 및 최단거리 정렬 시작")
+            
+            # API 비용 절약을 위해 상위 5개만 좌표 변환
+            top_n_candidates = candidates[:5]
+            candidates_with_score = []
+            
+            for doc in top_n_candidates:
+                addr =  doc.metadata.get('지역') or ""
+                p_lat, p_lng = await get_coordinates(addr) # 여기서 API 호출 발생 (최대 5회)
+                
+                dist = 9999.0
+                if p_lat and p_lng:
+                    dist = calculate_haversine_distance(center_lat, center_lng, p_lat, p_lng)
+                
+                candidates_with_score.append((dist, doc))
+            
+            # 거리순 정렬 (오름차순)
+            candidates_with_score.sort(key=lambda x: x[0])
+            
+            # 정렬된 순서대로 candidates 교체
+            candidates = [x[1] for x in candidates_with_score]
+            if candidates_with_score:
+                 print(f"DEBUG: 🎯 최단 거리 장소 선정: {candidates_with_score[0][0]:.1f}km")
+
+    # ------------------------------------------------------------------
+    # [3단계] 최종 반환
+    # ------------------------------------------------------------------
+    if not candidates:
+        print("DEBUG: ❌ 2차 검색까지 실패. 검색 결과 없음.")
+        # 빈 결과라도 에러 없이 처리하기 위해 깡통 데이터 리턴하거나 에러 메시지
+        return json.dumps({"name": "추천 장소 없음", "type": "정보없음", "description": "조건에 맞는 장소를 찾지 못했습니다."}, ensure_ascii=False)
+
+    # 최적 장소 선정 (1순위)
+    best_doc = candidates[0]
+    best_name = best_doc.metadata.get('장소명', '이름미상')
+    best_address = best_doc.metadata.get('지역', '')
+
+    # 설명 생성
     description = await desc_chain.ainvoke({
         "user_info": user_info,
         "place_name": best_name,
@@ -278,28 +349,29 @@ async def find_and_select_best_place(query: str, destination: str, anchor: str =
 
     result_data = {
         "name": best_name,
-        "type": best_doc.metadata.get('카테고리', '장소'), 
+        "type": best_doc.metadata.get('카테고리', '장소명'), 
         "description": description.strip(),
         "address": best_address,
-        "coordinates": None  
+        "coordinates": None 
     }
     
     print(f"✅ 최종 추천: {best_name}")
     return json.dumps(result_data, ensure_ascii=False)
 
 
+# --- [4] 기타 도구들 ---
+
 @tool
 async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
     """
-    [일정 정리 도구]
-    일정 리스트를 받아 시간순 타임라인을 생성하고, 상세 교통편 정보를 포함합니다.
+    [일정 정리 도구] 일정 리스트를 받아 시간순 타임라인 생성
     """
     print(f"\n--- [DEBUG] plan_itinerary_timeline 호출 ---")
     places_only = [item for item in itinerary if item.get('type') != 'move']
     
-    # 순환 참조 방지를 위해 함수 내부 import
     try:
         from src.scheduler.smart_scheduler import SmartScheduler
+        # 10시 시작이 기본이지만 스케줄러 내부 로직 따름
         scheduler = SmartScheduler(start_time_str="10:00")
         
         days = sorted(list(set(item.get('day', 1) for item in places_only)))
@@ -307,6 +379,7 @@ async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
         
         for day in days:
             day_items = [item for item in places_only if item.get('day', 1) == day]
+            # day 인자 전달 여부는 SmartScheduler 구현에 따름 (현재 구현은 day_items만 받음)
             day_schedule = await scheduler.plan_day(day_items)
             
             for item in day_schedule:
@@ -324,8 +397,6 @@ async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
         traceback.print_exc()
         return json.dumps(itinerary, ensure_ascii=False)
 
-
-# --- [복구] TSP 기반 경로 최적화 도구 ---
 def _solve_tsp(duration_matrix, start_fixed, n):
     """TSP 알고리즘"""
     min_duration = float('inf')
@@ -379,7 +450,6 @@ async def optimize_and_get_routes(places: List[str], start_location: str = "") -
         
     except Exception as e:
         return f"최적화 실패: {e}"
-
 
 @tool
 async def get_weather_forecast(destination: str, dates: str) -> str:
