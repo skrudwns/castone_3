@@ -9,7 +9,7 @@ from langchain_community.vectorstores.faiss import FAISS as LangchainFAISS
 from langchain_core.documents import Document
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REVIEW_FAISS_DIR = "/Users/seoungmun/Documents/work/3-2/project/travle_agent4/review_faiss"  # 필요하면 경로 수정
+REVIEW_FAISS_DIR = "/Users/seoungmun/Documents/work/3-2/project/travle_agent4/review-faiss"  # 필요하면 경로 수정
 
 def load_metadata_list(path: str):
     with open(path, "rb") as f:

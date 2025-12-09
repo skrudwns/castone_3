@@ -3,7 +3,6 @@
 from typing import List, Union, Dict
 import json
 from langchain_core.prompts import ChatPromptTemplate
-# 🚨 [수정] 최신 LangChain 호환성을 위해 표준 pydantic 사용
 from pydantic import BaseModel, Field 
 from src.config import LLM
 

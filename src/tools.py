@@ -1,5 +1,3 @@
-# src/tools.py
-
 import os, json, math
 import httpx
 import asyncio
@@ -278,9 +276,6 @@ async def find_and_select_best_place(query: str,
         print(f"DEBUG: 📍 기준점 좌표 조회: '{center_place}'")
         center_lat, center_lng = await get_coordinates(center_place)
 
-    # ------------------------------------------------------------------
-    # [1단계] 사용자 선호(user_info)를 포함한 정밀 검색
-    # ------------------------------------------------------------------
     search_query_v1 = f"{target_region} {query} {user_info} {category_filter}"
     print(f"DEBUG: 🔍 1차 검색 시도 (선호 포함): '{search_query_v1}'")
     
@@ -288,9 +283,6 @@ async def find_and_select_best_place(query: str,
     candidates = await _filter_candidates(docs_v1, target_region, exclude_places, category_filter)
     print(f"DEBUG: 🎯 1차 후보군 수: {len(candidates)}")
 
-    # ------------------------------------------------------------------
-    # [2단계] Fallback: 결과가 0개면 선호 빼고 재검색 (거리 우선 모드)
-    # ------------------------------------------------------------------
     if not candidates:
         print(f"DEBUG: ⚠️ 1차 검색 결과 없음 -> 2차 검색(선호 제외, 거리/카테고리 중심) 전환")
         
@@ -327,15 +319,10 @@ async def find_and_select_best_place(query: str,
             if candidates_with_score:
                  print(f"DEBUG: 🎯 최단 거리 장소 선정: {candidates_with_score[0][0]:.1f}km")
 
-    # ------------------------------------------------------------------
-    # [3단계] 최종 반환
-    # ------------------------------------------------------------------
     if not candidates:
         print("DEBUG: ❌ 2차 검색까지 실패. 검색 결과 없음.")
-        # 빈 결과라도 에러 없이 처리하기 위해 깡통 데이터 리턴하거나 에러 메시지
         return json.dumps({"name": "추천 장소 없음", "type": "정보없음", "description": "조건에 맞는 장소를 찾지 못했습니다."}, ensure_ascii=False)
 
-    # 최적 장소 선정 (1순위)
     best_doc = candidates[0]
     best_name = best_doc.metadata.get('장소명', '이름미상')
     best_address = best_doc.metadata.get('지역', '')
@@ -359,7 +346,6 @@ async def find_and_select_best_place(query: str,
     return json.dumps(result_data, ensure_ascii=False)
 
 
-# --- [4] 기타 도구들 ---
 
 @tool
 async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
@@ -371,7 +357,6 @@ async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
     
     try:
         from src.scheduler.smart_scheduler import SmartScheduler
-        # 10시 시작이 기본이지만 스케줄러 내부 로직 따름
         scheduler = SmartScheduler(start_time_str="10:00")
         
         days = sorted(list(set(item.get('day', 1) for item in places_only)))
@@ -379,7 +364,6 @@ async def plan_itinerary_timeline(itinerary: List[Dict]) -> str:
         
         for day in days:
             day_items = [item for item in places_only if item.get('day', 1) == day]
-            # day 인자 전달 여부는 SmartScheduler 구현에 따름 (현재 구현은 day_items만 받음)
             day_schedule = await scheduler.plan_day(day_items)
             
             for item in day_schedule:
