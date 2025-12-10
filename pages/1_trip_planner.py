@@ -126,7 +126,7 @@ st.caption(f"'{st.session_state.get('destination', '알 수 없는 목적지')}'
 # --- 좌측 사이드바 가이드 추가 ---
 with st.sidebar:
     # ===== 1. 현재 여행 정보 =====
-    st.header("📍 현재 여행 정보")
+    st.header("현재 여행 정보")
 
     st.markdown(f"**목적지:** {st.session_state.get('destination', '-')}")
     st.markdown(f"**여행 기간:** {st.session_state.get('dates', '-')}")
