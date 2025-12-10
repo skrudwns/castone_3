@@ -40,38 +40,47 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
     pdf.ln(20)
 
     # 2. 일차별 계획
-    sorted_itinerary = sorted(itinerary, key=lambda x: x['day'])
+    # 원본 순서를 유지하면서 day와 인덱스로 정렬 (같은 day 내 순서 보장)
+    sorted_itinerary = sorted(enumerate(itinerary), key=lambda x: (x[1]['day'], x[0]))
+    sorted_itinerary = [item[1] for item in sorted_itinerary]  # 인덱스 제거
+
+    # 첫 일차를 위한 새 페이지
+    pdf.add_page()
 
     for day_num in range(1, total_days + 1):
-        pdf.add_page()
+        # 첫 일차가 아니면 여유 공간 추가 (페이지는 자동으로 넘어감)
+        if day_num > 1:
+            pdf.ln(15)  # 일차 사이 여유 공간
+
         pdf.set_font_size(18)
         pdf.cell(0, 15, f"Day {day_num}", ln=True)
-        
+
         places_today = [item for item in sorted_itinerary if item['day'] == day_num]
-        
+
         if not places_today:
             pdf.set_font_size(12)
             pdf.cell(0, 10, "  - 계획된 장소가 없습니다.", ln=True)
+            pdf.ln(10)  # 빈 일차 후 여유 공간
             continue
 
         for i, item in enumerate(places_today):
             # 장소 이름
             pdf.set_font('NanumGothic', 'B', 12)
             pdf.cell(0, 8, f"  - [{item.get('type', '장소')}] {item.get('name', '이름 없음')}", ln=True)
-            
+
             # 설명
             if item.get('description'):
                 pdf.set_font('NanumGothic', '', 10)
                 pdf.set_x(15)
                 pdf.multi_cell(0, 5, f"    └ {item['description']}")
                 pdf.ln(2)
-            
+
             # [추가됨] 다음 장소로 가는 경로 정보 출력
             if i < len(places_today) - 1 and route_details:
                 # 저장할 때 썼던 키와 동일한 규칙으로 찾기 (DayN_0, DayN_1 ...)
                 route_key = f"Day{day_num}_{i}"
                 info = route_details.get(route_key)
-                
+
                 if info:
                     pdf.set_text_color(100, 100, 100) # 회색
                     pdf.set_font('NanumGothic', '', 9)
@@ -82,12 +91,13 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
                     pdf.set_text_color(0, 0, 0) # 다시 검정
                     pdf.ln(2)
 
+        # 일차별 구분선과 메모 공간
         pdf.ln(10)
         pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
         pdf.ln(5)
         pdf.set_font_size(14)
         pdf.cell(0, 10, "메모:", ln=True)
-        pdf.ln(40)
+        pdf.ln(20)  # 메모 공간 (페이지 넘김용 40에서 20으로 줄임)
 
     # 3. 종합 정보
     pdf.add_page()
@@ -112,6 +122,41 @@ def create_itinerary_pdf(itinerary, destination, dates, weather, final_routes, t
 st.set_page_config(page_title="AI 여행 플래너", layout="centered")
 st.title("💬 AI 여행 플래너")
 st.caption(f"'{st.session_state.get('destination', '알 수 없는 목적지')}' 여행 계획을 시작합니다.")
+
+# --- 좌측 사이드바 가이드 추가 ---
+with st.sidebar:
+    # ===== 1. 현재 여행 정보 =====
+    st.header("📍 현재 여행 정보")
+
+    st.markdown(f"**목적지:** {st.session_state.get('destination', '-')}")
+    st.markdown(f"**여행 기간:** {st.session_state.get('dates', '-')}")
+
+    st.markdown("---")
+
+    # ===== 2. 사용 가이드 =====
+    st.header("💡 사용 가이드")
+
+    st.markdown("""
+    **기본 질문 예시**
+    - "다음 날 계획을 알려줘"
+    - "맛집 추가해줘"
+    - "카페 추천해줘"
+    - "1일차 계획 다시 알려줘"
+
+    **장소 추가/변경**
+    - "[지역명] 관광지 추가해줘"
+    - "실내 활동으로 바꿔줘"
+    - "사진 찍기 좋은 곳 추천해줘"
+
+    **계획 수정**
+    - 날씨에 맞는 대안 요청
+    - 이동 시간을 고려한 재배치
+    - 특정 테마의 장소 추천
+
+    **완료 후**
+    - PDF 다운로드로 상세 일정 저장
+    - 이동 경로 및 소요시간 포함
+    """)
 
 @st.cache_resource
 def get_graph_app():
@@ -202,14 +247,14 @@ def run_ai_agent():
         "current_weather": st.session_state.current_weather,
         "show_pdf_button": st.session_state.show_pdf_button,
     }
-    
+
     response = APP.invoke(inputs)
-    
+
     st.session_state.messages = response.get('messages', st.session_state.messages)
     st.session_state.itinerary = response.get('itinerary', st.session_state.itinerary)
     if response.get('current_weather'):
         st.session_state.current_weather = response['current_weather']
-    
+
     if response.get('show_pdf_button'):
         st.session_state.show_pdf_button = True
 
@@ -269,7 +314,9 @@ if st.session_state.get("show_pdf_button", False):
             with st.spinner("구글 지도에서 실시간 교통 정보를 가져오는 중입니다..."):
                 # [핵심 수정] 날짜별로 장소를 분류해야 인덱스(i)를 0부터 다시 셀 수 있음
                 places_by_day = {}
-                sorted_all = sorted(st.session_state.itinerary, key=lambda x: x['day'])
+                # 원본 순서를 유지하면서 day와 인덱스로 정렬 (같은 day 내 순서 보장)
+                sorted_all = sorted(enumerate(st.session_state.itinerary), key=lambda x: (x[1]['day'], x[0]))
+                sorted_all = [item[1] for item in sorted_all]
                 for item in sorted_all:
                     d = item['day']
                     if d not in places_by_day: places_by_day[d] = []
@@ -303,8 +350,10 @@ if st.session_state.get("show_pdf_button", False):
 
         # [표시 로직] 계산된 경로가 있으면 화면에 보여주기
         if st.session_state.get("route_details"):
-            sorted_all = sorted(st.session_state.itinerary, key=lambda x: x['day'])
-            
+            # 원본 순서를 유지하면서 day와 인덱스로 정렬 (같은 day 내 순서 보장)
+            sorted_all = sorted(enumerate(st.session_state.itinerary), key=lambda x: (x[1]['day'], x[0]))
+            sorted_all = [item[1] for item in sorted_all]
+
             # [핵심 수정] 표시할 때도 날짜별로 분류해서 키를 찾아야 함
             places_by_day_display = {}
             for item in sorted_all:
@@ -377,10 +426,10 @@ if len(st.session_state.messages) == 1 and st.session_state.last_message_count =
 if user_input := st.chat_input(f"'{st.session_state.destination}' 여행에 대해 더 물어보세요"):
     st.session_state.messages.append(HumanMessage(content=user_input))
     st.chat_message("user").markdown(user_input)
-    
+
     with st.chat_message("assistant"):
         with st.spinner("AI 전문가 팀이 회의 중입니다..."):
             run_ai_agent()
-    
+
     st.session_state.last_message_count = len(st.session_state.messages)
     st.rerun()

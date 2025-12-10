@@ -15,7 +15,6 @@ if "start_date" not in st.session_state: st.session_state.start_date = None
 if "end_date" not in st.session_state: st.session_state.end_date = None
 if "user_preferences" not in st.session_state: st.session_state.user_preferences = {}
 if "activity_level" not in st.session_state: st.session_state.activity_level = 3
-if "additional_requests" not in st.session_state: st.session_state.additional_requests = ""
 if "preferences_collected" not in st.session_state: st.session_state.preferences_collected = False
 
 # AI 플래너 페이지에서 사용할 키 (미리 초기화)
@@ -41,7 +40,6 @@ st.subheader("2. 여행 스타일")
 gathering_type = st.selectbox("모임 성격", ["가족", "친구", "연인", "혼자"])
 travel_style = st.selectbox("선호 스타일", ["맛집 탐방", "힐링/휴양", "액티비티", "문화/역사", "자연 감상"])
 activity_level = st.slider("하루 활동량 (계획할 장소 수)", 1, 5, st.session_state.activity_level, help="1: 여유롭게(하루 1곳), 5: 빡빡하게(하루 5곳)")
-additional_requests = st.text_area("추가 요구사항 (선택)", placeholder="예: 해산물을 좋아해요, 사진 찍기 좋은 곳 위주로 알려주세요.")
 
 st.markdown("---")
 
@@ -53,7 +51,6 @@ if st.button("AI 플래너에게 정보 전달하고 시작하기", type="primar
         st.session_state.start_date = start_date
         st.session_state.end_date = end_date
         st.session_state.activity_level = activity_level # 활동량 저장
-        st.session_state.additional_requests = additional_requests
         st.session_state.user_preferences = { "gathering_type": gathering_type, "travel_style": travel_style }
 
         # 2. AI 플래너가 사용할 st.session_state 키에 맞춰 데이터 가공
@@ -67,8 +64,6 @@ if st.button("AI 플래너에게 정보 전달하고 시작하기", type="primar
             f"- 이번 여행은 '{gathering_type}'와(과) 함께 가는 여행입니다.",
             f"- 주된 여행 스타일은 '{travel_style}'입니다."
         ]
-        if additional_requests:
-            pref_list.append(f"- 추가 요청사항: {additional_requests}")
         st.session_state.preference = "\n".join(pref_list)
 
         # 3. 플래너 페이지로 전환하기 위한 상태 설정 및 초기화
