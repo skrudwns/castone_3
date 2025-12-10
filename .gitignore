@@ -2,6 +2,7 @@
 review-faiss/
 
 # 2. API 키 및 민감 정보 제외 (.env 파일)
+venv/
 .env
 
 # 3. 파이썬 캐시 파일 제외
