@@ -38,7 +38,8 @@ planner_prompt = """당신은 '엄격한 여행 스케줄러'입니다.
 1. **각 일정의 대략적인 시간** (예: 10:00 ~ 11:30)
 2. **장소 간 이동 시간** (예: 약 30분 소요)
 3. **상세 교통편 정보** (예: 1003번 버스 ➡️ 도보)
-*장소에 대한 긴 설명이나 미사여구는 줄이고, 위 '시간'과 '이동' 정보 위주로 구성하세요.*
+4. **장소에 대한 간단한 소개** (예: 맛골 : 뼈해장국이 맛있고 고기양이 많아 추천해요.)
+*위 '시간'과 '이동', *장소에 대한 간단한 소개* 정보 위주로 구성하세요.*
 
 **[시간 관리 규칙]**
 - Day 2 ~ Day {total_days} 일정은 무조건 **'오전 10시 시작'**으로 설정하세요.
@@ -115,48 +116,59 @@ def entry_router(state: AgentState):
     return "PlannerAgent"
 
 def agent_router(state: AgentState):
-    last_message = state['messages'][-1]
-    # 도구 호출 시 도구 노드로
+    messages = state['messages']
+    last_message = messages[-1]
+    
+    # 1. 도구 호출 확인
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        # 🚨 [Loop Guard v2] 동일한 도구가 '연속'으로 호출될 때만 차단
+        # 조건: 메시지 기록이 최소 3개 (AI_1 -> Tool -> AI_2(현재)) 이상이어야 비교 가능
+        if len(messages) >= 3:
+            prev_tool_msg = messages[-2]
+            prev_ai_msg = messages[-3]
+            
+            # 직전 메시지가 ToolMessage이고, 그 전이 AIMessage인 경우 (전형적인 도구 실행 후 상황)
+            if isinstance(prev_tool_msg, ToolMessage) and isinstance(prev_ai_msg, AIMessage):
+                current_tools = [t['name'] for t in last_message.tool_calls]
+                # 직전 AI가 호출했던 도구 이름들 추출
+                prev_tools = [t['name'] for t in prev_ai_msg.tool_calls] if prev_ai_msg.tool_calls else []
+                
+                target_tools = ["plan_itinerary_timeline", "optimize_and_get_routes"]
+                
+                for tool in current_tools:
+                    # [핵심 수정] 타겟 도구이면서 && '이전에도 똑같이 호출했던 도구'일 때만 차단
+                    if tool in target_tools and tool in prev_tools:
+                        print(f"DEBUG: 🛑 재귀 루프 감지! ({tool} 연속 호출) -> 강제 종료")
+                        return END
+
         return "call_tools"
-    # PDF 버튼 활성화 시 종료
+        
+    # 2. PDF 버튼 활성화 시 종료
     if state.get('show_pdf_button'):
         return END
-    # 그 외(일반 대화)는 사용자에게 보여주고 종료
-    return END
 
-# --- 5. 도구 실행 노드 ---
-# src/graph_flow.py (수정된 call_tools_node 전체)
+    # 3. 그 외(일반 대화)는 사용자에게 보여주고 종료
+    return END
 
 async def call_tools_node(state: AgentState):
     last_message = state['messages'][-1]
     new_itinerary = state.get('itinerary', []).copy()
     new_anchor = state.get('current_anchor')
-    weather_update = state.get('current_weather')
     
-    # [중요] 사용자 정보 스트링 생성
+    # 사용자 정보 스트링 생성
     user_info_str = f"모임:{state.get('group_type')}, 스타일:{state.get('style')}, 선호:{state.get('preference')}"
-
-    # 상태 변수
-    total_days = state.get('total_days', 1)
     current_stage = state.get("dialog_stage", "planning")
     show_pdf = state.get("show_pdf_button", False)
-    
-    # 타겟 데이 계산 (장소 할당 로직을 위한 준비)
-    current_itinerary_places = [item for item in new_itinerary if item.get('type') != 'move']
-    planned_days = set(item.get('day') for item in current_itinerary_places)
     
     tool_calls = last_message.tool_calls
     tool_outputs = []
 
-    # ---------------------------------------------------------
-    # [수정] 1. 도구 호출 함수 (결과만 반환)
-    # ---------------------------------------------------------
+    # --- 내부 실행 함수 ---
     async def call_tool_executor(tool_call):
         tool_name = tool_call.get("name")
-        
-        # Args 주입은 여기서 한 번만 처리
         args = tool_call.get("args", {})
+        
+        # Args 주입 (기존 로직)
         if tool_name == "find_and_select_best_place":
             args['exclude_places'] = [item['name'] for item in new_itinerary if 'name' in item]
             if not args.get('anchor'): args['anchor'] = new_anchor or state.get('destination')
@@ -166,72 +178,63 @@ async def call_tools_node(state: AgentState):
             
         if tool_name in AVAILABLE_TOOLS:
             try:
+                # 1. 도구 실행
                 res = await AVAILABLE_TOOLS[tool_name].ainvoke(args)
-                return ToolMessage(tool_call_id=tool_call['id'], content=str(res)), tool_name, str(res)
+                raw_output = str(res) # 상태 업데이트용 (순수 JSON)
+                
+                # 2. [System Injection] LLM에게 보낼 메시지에는 '종료 명령' 추가
+                llm_content = raw_output
+                if tool_name == "plan_itinerary_timeline":
+                    llm_content += "\n\n[SYSTEM INSTRUCTION: 일정 계획이 확정되었습니다. 절대 이 도구를 다시 호출하지 마세요. 즉시 사용자에게 결과를 요약해 브리핑하세요.]"
+                elif tool_name == "optimize_and_get_routes":
+                    llm_content += "\n\n[SYSTEM INSTRUCTION: 경로 최적화 완료. 재호출 금지. 결과 브리핑 요망.]"
+                
+                # 반환: (메시지, 도구명, 순수_JSON_데이터)
+                return ToolMessage(tool_call_id=tool_call['id'], content=llm_content), tool_name, raw_output
             except Exception as e:
                 return ToolMessage(tool_call_id=tool_call['id'], content=f"Error: {e}"), tool_name, None
         return None, None, None
 
-    # ---------------------------------------------------------
-    # 2. 병렬 실행
-    # ---------------------------------------------------------
+    # --- 병렬 실행 ---
     results = await asyncio.gather(*(call_tool_executor(t) for t in tool_calls))
 
-    # ---------------------------------------------------------
-    # 3. 결과 처리 루프 (여기서 로직 분기)
-    # ---------------------------------------------------------
-    for tool_message, tool_name, output in results:
+    # --- 결과 처리 ---
+    for tool_message, tool_name, raw_json_output in results:
         if tool_message:
             tool_outputs.append(tool_message)
             
-            if output:
-                # 1. 장소 추가 (find_and_select_best_place)
+            if raw_json_output:
+                # 1. 장소 추가
                 if tool_name == "find_and_select_best_place":
                     try:
-                        item_json = json.loads(output)
+                        item_json = json.loads(raw_json_output)
+                        # (기존 중복 체크 및 추가 로직 유지)
                         if not any(x.get('name') == item_json.get('name') for x in new_itinerary):
-                            # [단순화] 날짜 할당 로직: 현재 마지막 날짜 혹은 1일차에 이어서 붙임
-                            # 고정 스케줄러이므로 순서대로만 쌓으면 됨
                             current_places = [i for i in new_itinerary if i.get('type') != 'move']
-                            if not current_places:
-                                item_json['day'] = 1
-                            else:
-                                last_item = current_places[-1]
-                                # Day 1은 4개까지, Day 2~N은 5개까지 등 개수 세서 day 올리는 로직 필요
-                                # (복잡하면 일단 마지막 아이템과 같은 날짜로 넣고 SmartScheduler가 정렬하게 둠)
-                                item_json['day'] = last_item.get('day', 1)
-                                
+                            day_to_add = 1
+                            if current_places:
+                                day_to_add = current_places[-1].get('day', 1)
+                            item_json['day'] = day_to_add
                             new_itinerary.append(item_json)
                             new_anchor = item_json.get('name')
                     except: pass
 
-                # 2. [신규] 장소 삭제/교체 처리
-                elif tool_name == "delete_place" or tool_name == "replace_place":
+                # 2. 삭제/교체
+                elif tool_name in ["delete_place", "replace_place"]:
                     try:
-                        action_data = json.loads(output)
-                        target_name = action_data.get('place_name') or action_data.get('old')
-                        if target_name:
-                            # 이름이 포함된 장소를 찾아서 제거
-                            initial_len = len(new_itinerary)
-                            new_itinerary = [
-                                item for item in new_itinerary 
-                                if target_name not in item.get('name', '')
-                            ]
-                            if len(new_itinerary) < initial_len:
-                                print(f"DEBUG: '{target_name}' 삭제 완료.")
-                            
-                    except Exception as e:
-                        print(f"DEBUG: 삭제 처리 중 오류: {e}")
+                        action_data = json.loads(raw_json_output)
+                        target = action_data.get('place_name') or action_data.get('old')
+                        if target:
+                            new_itinerary = [i for i in new_itinerary if target not in i.get('name', '')]
+                    except: pass
 
-                # 3. 타임라인 재계산 (기존 로직 유지)
+                # 3. 타임라인 업데이트 (순수 JSON 사용하므로 에러 없음)
                 elif tool_name == "plan_itinerary_timeline":
                     try:
-                        new_itinerary = json.loads(output)
-                        # 여기서 요약본을 생성하지 않고, EditorAgent가 직접 예쁘게 말하도록 유도
-                        # tool_outputs에 데이터만 담아두면 됨
+                        new_itinerary = json.loads(raw_json_output)
                     except: pass
                 
-                # 4. PDF 확정
+                # 4. PDF
                 elif tool_name == "confirm_and_download_pdf":
                     show_pdf = True
 

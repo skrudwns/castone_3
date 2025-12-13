@@ -22,6 +22,33 @@ except ImportError:
 
 # --- [1] LLM 체인 정의 (지역 추출, 설명 생성) ---
 
+query_gen_prompt = PromptTemplate.from_template("""
+역할: 당신은 '검색어 최적화 전문가'입니다.
+목표: 사용자의 요청과 취향을 분석하여, 벡터 데이터베이스에서 가장 정확한 장소를 찾을 수 있는 **3개의 검색 쿼리**를 생성하세요.
+
+[입력 정보]
+- 여행지/지역: {target_region}
+- 사용자 검색어: {query}
+- 사용자 취향/정보: {user_info}
+- 카테고리 필터: {category_filter}
+
+[지침]
+1. 사용자의 자연어 문장(취향)에서 **핵심 키워드(형용사, 명사)**만 추출하세요. (예: "조용한", "뷰맛집", "재즈")
+2. 지역명과 핵심 키워드를 조합하여 검색어를 만드세요.
+3. 다음 3가지 관점의 쿼리를 생성하세요:
+   - 쿼리 1: 지역명 + 사용자 검색어 (기본 정확도 중심)
+   - 쿼리 2: 지역명 + 사용자 검색어 + 취향 키워드 (구체적 니즈 중심)
+   - 쿼리 3: 지역명 + 분위기/테마 키워드 (광범위 탐색)
+4. 결과는 오직 쉼표(,)로 구분된 문자열로만 출력하세요. 다른 설명은 생략하세요.
+
+[예시]
+입력: 지역="서울", 검색어="카페", 취향="조용하고 작업하기 좋은 곳", 필터="카페"
+출력: 서울 카페, 서울 조용한 작업하기 좋은 카페, 서울 스터디 카페 분위기
+""")
+
+query_gen_chain = query_gen_prompt | LLM | StrOutputParser()
+
+
 # 1-1. 검색어에서 행정구역 추출 (LLM fallback용)
 region_prompt = PromptTemplate.from_template("""
 역할: 당신은 '지명 정규화 전문가'입니다.
@@ -276,12 +303,40 @@ async def find_and_select_best_place(query: str,
         print(f"DEBUG: 📍 기준점 좌표 조회: '{center_place}'")
         center_lat, center_lng = await get_coordinates(center_place)
 
-    search_query_v1 = f"{target_region} {query} {user_info} {category_filter}"
-    print(f"DEBUG: 🔍 1차 검색 시도 (선호 포함): '{search_query_v1}'")
+    try:
+        # A. 쿼리 생성
+        generated_queries_str = await query_gen_chain.ainvoke({
+            "target_region": target_region,
+            "query": query,
+            "user_info": user_info,
+            "category_filter": category_filter
+        })
+        # 쉼표로 분리하여 리스트화
+        search_queries = [q.strip() for q in generated_queries_str.split(',') if q.strip()]
+        print(f"DEBUG: 🧠 생성된 멀티 쿼리: {search_queries}")
+        
+    except Exception as e:
+        print(f"DEBUG: 쿼리 생성 실패({e}) -> 기본 쿼리 사용")
+        search_queries = [f"{target_region} {query} {category_filter}"]
+    # B. 병렬 검색 실행 (모든 쿼리에 대해 동시에 검색)
+    # 각 쿼리당 상위 10개씩 검색 (너무 많으면 느려지므로 조절)
+    tasks = [_search_docs(q, k=10) for q in search_queries]
+    results_list = await asyncio.gather(*tasks)
     
-    docs_v1 = await _search_docs(search_query_v1, k=20)
-    candidates = await _filter_candidates(docs_v1, target_region, exclude_places, category_filter)
-    print(f"DEBUG: 🎯 1차 후보군 수: {len(candidates)}")
+    # C. 결과 통합 및 중복 제거 (Dedup)
+    seen_places = set()
+    aggregated_docs = []
+    
+    for docs in results_list:
+        for doc in docs:
+            p_name = doc.metadata.get('장소명', '')
+            # 이미 결과 목록에 있거나, 제외 목록에 있다면 스킵
+            if p_name and p_name not in seen_places and p_name not in exclude_places:
+                seen_places.add(p_name)
+                aggregated_docs.append(doc)
+    
+    candidates = await _filter_candidates(aggregated_docs, target_region, exclude_places, category_filter)
+    print(f"DEBUG: 🎯 필터링 후 후보군 수: {len(candidates)}")
 
     if not candidates:
         print(f"DEBUG: ⚠️ 1차 검색 결과 없음 -> 2차 검색(선호 제외, 거리/카테고리 중심) 전환")
